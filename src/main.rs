@@ -4,9 +4,9 @@ mod platform;
 mod strategy;
 
 use clap::Parser;
-use config::{Action, ActionSpec, RuntimeConfig};
+use config::RuntimeConfig;
 use key::KeyEvent;
-use platform::{EventResponse, Platform};
+use platform::{EventResponse, Platform, PlatformInterface};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use strategy::{PlatformHandle, StrategyContext};
@@ -102,29 +102,13 @@ async fn handle_event(
 
     // Resolve the action based on window context
     let window = platform.get_active_window();
-    let action = match &binding.action {
-        ActionSpec::Simple(action) => action,
-        ActionSpec::Conditional(rules) => {
-            let mut resolved = None;
-            for rule in rules {
-                if rule.condition.is_empty() || rule.condition.window.matches(&window) {
-                    resolved = Some(&rule.action);
-                    break;
-                }
-            }
-            match resolved {
-                Some(action) => action,
-                None => return EventResponse::Passthrough,
-            }
-        }
+    let Some(action) = config.resolve_action(event.key, &window) else {
+        return EventResponse::Passthrough;
     };
 
     // Handle passthrough/block actions directly
-    if matches!(action, Action::Passthrough) {
-        return EventResponse::Passthrough;
-    }
-    if matches!(action, Action::Block) {
-        return EventResponse::Block;
+    if let Some(response) = action.as_response() {
+        return response;
     }
 
     // TODO: For strategies that don't need async (direct action execution),

@@ -6,32 +6,151 @@
 //! - GetClassNameW for window class
 //! - GetWindowThreadProcessId + OpenProcess + QueryFullProcessImageNameW for binary
 //! - SendInput for synthetic key injection
+//! - GetKeyNameTextW + MapVirtualKeyW for key name resolution
 
 use super::{EventResponse, MediaCommand, PlatformInterface, SyntheticKey};
 use crate::config::WindowInfo;
 use crate::key::{KeyCode, KeyEvent};
+use crate::strategy::PlatformHandle;
 use anyhow::{Result, anyhow};
+use std::collections::HashMap;
 use std::ffi::OsString;
+use std::future::Future;
 use std::os::windows::ffi::OsStringExt;
 use std::sync::OnceLock;
 use tokio::sync::mpsc;
 use tracing::{debug, info, trace, warn};
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    GetCurrentThreadId, OpenProcess, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
+    QueryFullProcessImageNameW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput,
-    VIRTUAL_KEY,
+    GetKeyNameTextW, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT,
+    KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW, SendInput, VIRTUAL_KEY,
 };
-use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetClassNameW, GetForegroundWindow, GetMessageW,
     GetWindowTextW, GetWindowThreadProcessId, KBDLLHOOKSTRUCT, MSG, PostThreadMessageW,
-    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_KEYDOWN,
-    WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP,
+    WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 use windows::core::PWSTR;
+
+// ============================================================================
+// Key Name Resolution
+// ============================================================================
+
+/// Keys without scan codes on standard keyboards (GetKeyNameTextW can't look them up)
+#[rustfmt::skip]
+const HARDCODED_KEYS: &[(&str, u32)] = &[
+    // F13-F24
+    ("f13", 0x7C), ("f14", 0x7D), ("f15", 0x7E), ("f16", 0x7F),
+    ("f17", 0x80), ("f18", 0x81), ("f19", 0x82), ("f20", 0x83),
+    ("f21", 0x84), ("f22", 0x85), ("f23", 0x86), ("f24", 0x87),
+
+    // Media keys
+    ("media_next_track", 0xB0), ("media_next", 0xB0),
+    ("media_prev_track", 0xB1), ("media_prev", 0xB1),
+    ("media_stop", 0xB2),
+    ("media_play_pause", 0xB3), ("media_play", 0xB3),
+    ("volume_mute", 0xAD), ("mute", 0xAD),
+    ("volume_down", 0xAE), ("vol_down", 0xAE),
+    ("volume_up", 0xAF), ("vol_up", 0xAF),
+
+    // Browser keys
+    ("browser_back", 0xA6), ("browser_forward", 0xA7),
+    ("browser_refresh", 0xA8), ("browser_stop", 0xA9),
+    ("browser_search", 0xAA), ("browser_favorites", 0xAB),
+    ("browser_home", 0xAC),
+
+    // Launch keys
+    ("launch_mail", 0xB4), ("launch_media_select", 0xB5),
+    ("launch_app1", 0xB6), ("launch_app2", 0xB7),
+
+    // Left/right modifier variants (GetKeyNameTextW returns generic names)
+    ("lshift", 0xA0), ("rshift", 0xA1),
+    ("lctrl", 0xA2), ("lcontrol", 0xA2),
+    ("rctrl", 0xA3), ("rcontrol", 0xA3),
+    ("lalt", 0xA4), ("lmenu", 0xA4),
+    ("ralt", 0xA5), ("rmenu", 0xA5),
+    ("lwin", 0x5B), ("rwin", 0x5C),
+
+    // Common aliases
+    ("space", 0x20), ("spacebar", 0x20),
+    ("enter", 0x0D), ("return", 0x0D),
+    ("esc", 0x1B), ("escape", 0x1B),
+    ("backspace", 0x08), ("back", 0x08),
+    ("tab", 0x09),
+    ("insert", 0x2D), ("ins", 0x2D),
+    ("delete", 0x2E), ("del", 0x2E),
+    ("home", 0x24), ("end", 0x23),
+    ("pageup", 0x21), ("page_up", 0x21), ("pgup", 0x21),
+    ("pagedown", 0x22), ("page_down", 0x22), ("pgdn", 0x22),
+    ("up", 0x26), ("down", 0x28), ("left", 0x25), ("right", 0x27),
+    ("capslock", 0x14), ("caps_lock", 0x14), ("caps", 0x14),
+    ("numlock", 0x90), ("num_lock", 0x90),
+    ("scrolllock", 0x91), ("scroll_lock", 0x91),
+    ("printscreen", 0x2C), ("print_screen", 0x2C), ("prtsc", 0x2C),
+    ("pause", 0x13),
+
+    // Numpad keys
+    ("numpad0", 0x60), ("numpad1", 0x61), ("numpad2", 0x62),
+    ("numpad3", 0x63), ("numpad4", 0x64), ("numpad5", 0x65),
+    ("numpad6", 0x66), ("numpad7", 0x67), ("numpad8", 0x68),
+    ("numpad9", 0x69),
+    ("numpad_add", 0x6B), ("numpad_plus", 0x6B),
+    ("numpad_subtract", 0x6D), ("numpad_minus", 0x6D),
+    ("numpad_multiply", 0x6A), ("numpad_mul", 0x6A),
+    ("numpad_divide", 0x6F), ("numpad_div", 0x6F),
+    ("numpad_decimal", 0x6E), ("numpad_dot", 0x6E),
+];
+
+/// Get human-readable key name from Windows VK code
+pub fn get_key_name(vk: u32) -> String {
+    unsafe {
+        let mut buffer = [0u16; 64];
+
+        let scan_code = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC_EX);
+        let extended = (scan_code & 0xFF00) == 0xE000 || (scan_code & 0xFF00) == 0xE100;
+        let lparam = ((scan_code & 0xFF) << 16) | (u32::from(extended) << 24);
+
+        let len = GetKeyNameTextW(lparam as i32, &mut buffer);
+        if len > 0 {
+            OsString::from_wide(&buffer[..len as usize])
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            format!("VK_{:#04X}", vk)
+        }
+    }
+}
+
+/// Build reverse lookup map: name -> VK code
+pub fn build_key_name_map() -> HashMap<String, u32> {
+    let mut map = HashMap::new();
+
+    // Add hardcoded keys first (OS-provided names can override if available)
+    for &(name, vk) in HARDCODED_KEYS {
+        map.insert(name.to_string(), vk);
+    }
+
+    // Probe all VK codes for OS-provided names
+    for vk in 0..=255 {
+        let name = get_key_name(vk);
+        if !name.is_empty() && !name.starts_with("VK_") {
+            let normalized = name.to_lowercase();
+            map.insert(normalized.clone(), vk);
+            map.insert(format!("vk_{}", normalized), vk);
+        }
+    }
+
+    map
+}
+
+// ============================================================================
+// Hook Thread
+// ============================================================================
 
 /// Channel message from hook thread to main thread
 struct HookEvent {
@@ -53,10 +172,14 @@ pub struct Platform {
     event_rx: mpsc::UnboundedReceiver<HookEvent>,
 }
 
-// Inherent impl with public methods - this is what external code uses
-impl Platform {
-    /// Create a new platform instance
-    pub fn new() -> Self {
+impl Default for Platform {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PlatformInterface for Platform {
+    fn new() -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
         // Store sender in global for hook callback access
@@ -72,13 +195,11 @@ impl Platform {
     /// Captures keyboard events and calls `handler` for each.
     /// The handler receives the event and a PlatformHandle for
     /// querying window info and executing actions.
-    pub async fn run<F, Fut>(&mut self, mut handler: F) -> Result<()>
+    async fn run<F, Fut>(&mut self, mut handler: F) -> Result<()>
     where
-        F: FnMut(KeyEvent, crate::strategy::PlatformHandle) -> Fut,
-        Fut: std::future::Future<Output = EventResponse>,
+        F: FnMut(KeyEvent, PlatformHandle) -> Fut,
+        Fut: Future<Output = EventResponse>,
     {
-        use crate::strategy::PlatformHandle;
-
         info!("initializing Windows keyboard hook");
 
         // Spawn the hook thread (Win32 message pump must run on dedicated thread)
@@ -107,13 +228,11 @@ impl Platform {
         Ok(())
     }
 
-    /// Query information about the currently focused window
-    pub fn get_active_window(&self) -> WindowInfo {
+    fn get_active_window(&self) -> WindowInfo {
         get_foreground_window_info()
     }
 
-    /// Inject a synthetic key press
-    pub fn send_key(&self, key: SyntheticKey) {
+    fn send_key(&self, key: SyntheticKey) {
         let vk = match key {
             SyntheticKey::BrowserBack => 0xA6,    // VK_BROWSER_BACK
             SyntheticKey::BrowserForward => 0xA7, // VK_BROWSER_FORWARD
@@ -121,8 +240,7 @@ impl Platform {
         send_key_press(vk);
     }
 
-    /// Execute a media control command
-    pub fn send_media(&self, cmd: MediaCommand) {
+    fn send_media(&self, cmd: MediaCommand) {
         let vk = match cmd {
             MediaCommand::PlayPause => 0xB3, // VK_MEDIA_PLAY_PAUSE
             MediaCommand::Next => 0xB0,      // VK_MEDIA_NEXT_TRACK
@@ -130,39 +248,6 @@ impl Platform {
             MediaCommand::Stop => 0xB2,      // VK_MEDIA_STOP
         };
         send_key_press(vk);
-    }
-}
-
-impl Default for Platform {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// Trait impl for compile-time interface verification only
-impl PlatformInterface for Platform {
-    fn new() -> Self {
-        Self::new()
-    }
-
-    async fn run<F, Fut>(&mut self, handler: F) -> Result<()>
-    where
-        F: FnMut(KeyEvent, crate::strategy::PlatformHandle) -> Fut,
-        Fut: std::future::Future<Output = EventResponse>,
-    {
-        Self::run(self, handler).await
-    }
-
-    fn get_active_window(&self) -> WindowInfo {
-        Self::get_active_window(self)
-    }
-
-    fn send_key(&self, key: SyntheticKey) {
-        Self::send_key(self, key)
-    }
-
-    fn send_media(&self, cmd: MediaCommand) {
-        Self::send_media(self, cmd)
     }
 }
 

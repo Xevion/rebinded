@@ -4,11 +4,13 @@
 //! - Input event capture (keyboard hooks)
 //! - Window information queries
 //! - Synthetic input (key simulation, media control)
+//! - Key name resolution (OS-specific key code <-> name mapping)
 //!
-//! Each platform module (windows.rs, linux.rs) implements the same `Platform` struct
-//! with inherent methods matching the `PlatformInterface` trait signature.
-//! The trait exists for compile-time verification - each platform module
-//! implements both inherent methods (for actual use) and the trait (for verification).
+//! Each platform module (windows.rs, linux.rs) exports a `Platform` struct that
+//! implements the `PlatformInterface` trait. The trait is the primary interface -
+//! all platform methods are called through it. Since only one platform is compiled
+//! per target (via cfg), the compiler monomorphizes all trait calls, giving us
+//! zero-cost abstraction with compile-time contract verification.
 
 #[cfg(unix)]
 mod linux;
@@ -17,9 +19,11 @@ mod windows;
 
 // Re-export the platform-specific implementation
 #[cfg(unix)]
-pub use linux::Platform;
+pub use linux::{Platform, build_key_name_map, get_key_name};
 #[cfg(windows)]
-pub use windows::Platform;
+pub use windows::{Platform, build_key_name_map, get_key_name};
+
+use std::future::Future;
 
 use crate::config::WindowInfo;
 use crate::key::KeyEvent;
@@ -49,16 +53,14 @@ pub enum SyntheticKey {
     BrowserForward,
 }
 
-use std::future::Future;
-
 /// Interface contract for platform implementations.
 ///
-/// Both `windows::Platform` and `linux::Platform` must implement this trait.
-/// The trait is private and only used for compile-time verification that
-/// both platforms have the same interface. Actual method calls go through
-/// the inherent `impl Platform` methods which have the same signatures.
-#[allow(dead_code, async_fn_in_trait)]
-pub(crate) trait PlatformInterface {
+/// Both `windows::Platform` and `linux::Platform` implement this trait.
+/// All platform methods are called through this trait. Since only one
+/// platform is compiled per target (via cfg), the compiler monomorphizes
+/// all calls - no vtable overhead.
+#[allow(async_fn_in_trait)]
+pub trait PlatformInterface {
     /// Create a new platform instance
     fn new() -> Self
     where

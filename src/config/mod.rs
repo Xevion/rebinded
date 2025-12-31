@@ -16,8 +16,8 @@ pub use types::{
 
 use crate::key::KeyCode;
 use crate::strategy::{GatedHoldConfig, GatedHoldStrategy, KeyStrategy};
-use serde::de::IntoDeserializer;
 use serde::Deserialize;
+use serde::de::IntoDeserializer;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -54,14 +54,16 @@ impl std::fmt::Debug for RuntimeConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RuntimeConfig")
             .field("bindings", &self.bindings)
-            .field("strategies", &format!("<{} strategies>", self.strategies.len()))
+            .field(
+                "strategies",
+                &format!("<{} strategies>", self.strategies.len()),
+            )
             .finish()
     }
 }
 
 impl RuntimeConfig {
     /// Resolve which action to take for a given key and window context
-    #[allow(dead_code)]
     pub fn resolve_action(&self, key: KeyCode, window: &WindowInfo) -> Option<&Action> {
         let binding = self.bindings.get(&key)?;
 
@@ -431,7 +433,6 @@ impl ConfigLoader {
             strategies,
         }
     }
-
 }
 
 /// Parse an action string into an Action enum
@@ -551,7 +552,7 @@ mod tests {
         "#;
         let result = load_from_str("test.toml", toml.to_string());
         assert!(result.is_err());
-        
+
         // Should have multiple errors
         if let Err(ConfigError::Validation(v)) = result {
             // Check that debug output mentions both issues

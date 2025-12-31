@@ -232,7 +232,7 @@ impl Action {
     ///
     /// Note: `Passthrough` and `Block` are handled at the event loop level,
     /// not here - calling execute on them is a no-op.
-    pub fn execute(&self, platform: &crate::platform::Platform) {
+    pub fn execute(&self, platform: &impl crate::platform::PlatformInterface) {
         use crate::platform::{MediaCommand, SyntheticKey};
         use tracing::debug;
 
@@ -246,6 +246,19 @@ impl Action {
             Action::BrowserBack => platform.send_key(SyntheticKey::BrowserBack),
             Action::BrowserForward => platform.send_key(SyntheticKey::BrowserForward),
             Action::Passthrough | Action::Block => {}
+        }
+    }
+
+    /// Returns the corresponding EventResponse for non-executable actions.
+    ///
+    /// - `Passthrough` → `Some(EventResponse::Passthrough)`
+    /// - `Block` → `Some(EventResponse::Block)`
+    /// - All other actions → `None` (must be executed via platform)
+    pub fn as_response(&self) -> Option<crate::platform::EventResponse> {
+        match self {
+            Action::Passthrough => Some(crate::platform::EventResponse::Passthrough),
+            Action::Block => Some(crate::platform::EventResponse::Block),
+            _ => None,
         }
     }
 }

@@ -10,7 +10,7 @@ pub use gated_hold::{GatedHoldConfig, GatedHoldStrategy};
 
 use crate::config::{Action, WindowInfo};
 use crate::key::KeyEvent;
-use crate::platform::{EventResponse, MediaCommand, Platform, SyntheticKey};
+use crate::platform::{EventResponse, MediaCommand, Platform, PlatformInterface, SyntheticKey};
 use async_trait::async_trait;
 use std::time::Duration;
 

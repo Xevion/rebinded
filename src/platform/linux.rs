@@ -9,25 +9,68 @@
 use super::{EventResponse, MediaCommand, PlatformInterface, SyntheticKey};
 use crate::config::WindowInfo;
 use crate::key::KeyEvent;
+use crate::strategy::PlatformHandle;
 use anyhow::Result;
+use std::collections::HashMap;
+use std::future::Future;
 use std::time::Duration;
 use tracing::{info, warn};
+
+// ============================================================================
+// Key Name Resolution
+// ============================================================================
+
+/// Get human-readable key name from Linux evdev code
+pub fn get_key_name(code: u32) -> String {
+    if code > u16::MAX as u32 {
+        return format!("UNKNOWN_{:#06X}", code);
+    }
+    format!("{:?}", evdev::Key::new(code as u16))
+}
+
+/// Build reverse lookup map: name -> evdev code
+pub fn build_key_name_map() -> HashMap<String, u32> {
+    let mut map = HashMap::new();
+
+    // Probe evdev key range (0-767 covers all standard keys)
+    for code in 0..768u32 {
+        let name = get_key_name(code);
+        if !name.starts_with("UNKNOWN") {
+            let normalized = name.to_lowercase();
+            map.insert(normalized.clone(), code);
+
+            // Strip "KEY_" prefix for convenience: "KEY_F13" -> "f13"
+            if let Some(short) = normalized.strip_prefix("key_") {
+                map.insert(short.to_string(), code);
+            }
+            // Strip "BTN_" prefix for buttons
+            if let Some(short) = normalized.strip_prefix("btn_") {
+                map.insert(short.to_string(), code);
+            }
+        }
+    }
+
+    map
+}
 
 /// Linux platform implementation
 pub struct Platform {}
 
-// Inherent impl with public methods - this is what external code uses
-impl Platform {
-    /// Create a new platform instance
-    pub fn new() -> Self {
+impl Default for Platform {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PlatformInterface for Platform {
+    fn new() -> Self {
         Self {}
     }
 
-    /// Run the platform event loop with an async handler
-    pub async fn run<F, Fut>(&mut self, mut _handler: F) -> Result<()>
+    async fn run<F, Fut>(&mut self, mut _handler: F) -> Result<()>
     where
-        F: FnMut(KeyEvent, crate::strategy::PlatformHandle) -> Fut,
-        Fut: std::future::Future<Output = EventResponse>,
+        F: FnMut(KeyEvent, PlatformHandle) -> Fut,
+        Fut: Future<Output = EventResponse>,
     {
         info!("starting Linux input handler");
 
@@ -47,8 +90,7 @@ impl Platform {
         }
     }
 
-    /// Query information about the currently focused window
-    pub fn get_active_window(&self) -> WindowInfo {
+    fn get_active_window(&self) -> WindowInfo {
         // TODO: Implement using x11rb
         // 1. Get root window
         // 2. Get _NET_ACTIVE_WINDOW property -> active window ID
@@ -58,50 +100,15 @@ impl Platform {
         WindowInfo::default()
     }
 
-    /// Inject a synthetic key press
-    pub fn send_key(&self, key: SyntheticKey) {
+    fn send_key(&self, key: SyntheticKey) {
         // TODO: Implement using uinput or xdotool
         // For browser back/forward, could also send Alt+Left / Alt+Right
         warn!(?key, "send_key not implemented on Linux");
     }
 
-    /// Execute a media control command
-    pub fn send_media(&self, cmd: MediaCommand) {
+    fn send_media(&self, cmd: MediaCommand) {
         // TODO: Implement using D-Bus MPRIS (more reliable than key simulation)
         // Could use zbus crate for D-Bus, or shell out to playerctl
         warn!(?cmd, "send_media not implemented on Linux");
-    }
-}
-
-impl Default for Platform {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// Trait impl for compile-time interface verification only
-impl PlatformInterface for Platform {
-    fn new() -> Self {
-        Self::new()
-    }
-
-    async fn run<F, Fut>(&mut self, handler: F) -> Result<()>
-    where
-        F: FnMut(KeyEvent, crate::strategy::PlatformHandle) -> Fut,
-        Fut: std::future::Future<Output = EventResponse>,
-    {
-        Self::run(self, handler).await
-    }
-
-    fn get_active_window(&self) -> WindowInfo {
-        Self::get_active_window(self)
-    }
-
-    fn send_key(&self, key: SyntheticKey) {
-        Self::send_key(self, key)
-    }
-
-    fn send_media(&self, cmd: MediaCommand) {
-        Self::send_media(self, cmd)
     }
 }
