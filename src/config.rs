@@ -170,7 +170,7 @@ fn deserialize_action<'de, D>(deserializer: D) -> Result<ActionSpec, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    use serde::de::{self, Visitor};
+    use serde::de::{self, IntoDeserializer, Visitor};
 
     struct ActionSpecVisitor;
 
@@ -185,31 +185,8 @@ where
         where
             E: de::Error,
         {
-            let action = match value {
-                "media_play_pause" => Action::MediaPlayPause,
-                "media_next" => Action::MediaNext,
-                "media_prev" => Action::MediaPrev,
-                "media_stop" => Action::MediaStop,
-                "browser_back" => Action::BrowserBack,
-                "browser_forward" => Action::BrowserForward,
-                "passthrough" => Action::Passthrough,
-                "block" => Action::Block,
-                _ => {
-                    return Err(de::Error::unknown_variant(
-                        value,
-                        &[
-                            "media_play_pause",
-                            "media_next",
-                            "media_prev",
-                            "media_stop",
-                            "browser_back",
-                            "browser_forward",
-                            "passthrough",
-                            "block",
-                        ],
-                    ))
-                }
-            };
+            // Delegate to Action's derived Deserialize implementation
+            let action = Action::deserialize(value.into_deserializer())?;
             Ok(ActionSpec::Simple(action))
         }
 
@@ -347,5 +324,17 @@ mod tests {
         let profile = config.get_debounce("f15").unwrap();
         assert!(profile.initial_hold_ms == 150);
         assert!(profile.repeat_window_ms == 2000);
+    }
+
+    #[test]
+    fn test_invalid_action_name() {
+        let toml = r#"
+            [bindings.f13]
+            action = "invalid_action"
+        "#;
+        let result: Result<Config, _> = toml::from_str(toml);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("unknown variant"));
     }
 }
