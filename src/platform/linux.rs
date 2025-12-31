@@ -1,66 +1,107 @@
-//! Linux-specific implementation
+//! Linux-specific platform implementation
 //!
-//! Key components:
+//! Key components (TODO):
 //! - evdev for raw input device access (requires /dev/input permissions)
 //! - X11 (via x11rb) or Wayland for window queries
 //! - uinput for synthetic input injection
-//!
-//! Alternative approaches:
-//! - keyd (system-level, might be simpler for basic remapping)
-//! - libinput for input handling
+//! - D-Bus MPRIS for media control
 
-use crate::config::{Config, WindowInfo};
+use super::{EventResponse, MediaCommand, PlatformInterface, SyntheticKey};
+use crate::config::WindowInfo;
+use crate::key::KeyEvent;
 use anyhow::Result;
+use std::time::Duration;
 use tracing::{info, warn};
 
-pub async fn run(config: Config) -> Result<()> {
-    info!("starting Linux input handler");
+/// Linux platform implementation
+pub struct Platform {}
 
-    // TODO: Implement Linux input handling
-    // Options:
-    // 1. evdev: Read from /dev/input/eventX, grab the device, filter F13-F24
-    // 2. Use libinput for higher-level input handling
-    //
-    // For window queries:
-    // - X11: Use x11rb crate, query _NET_ACTIVE_WINDOW, then WM_NAME, WM_CLASS
-    // - Wayland: More complex, compositor-specific (wlr-foreign-toplevel-management)
+// Inherent impl with public methods - this is what external code uses
+impl Platform {
+    /// Create a new platform instance
+    pub fn new() -> Self {
+        Self {}
+    }
 
-    warn!("Linux handler not yet implemented - running placeholder loop");
+    /// Run the platform event loop with an async handler
+    pub async fn run<F, Fut>(&mut self, mut _handler: F) -> Result<()>
+    where
+        F: FnMut(KeyEvent, crate::strategy::PlatformHandle) -> Fut,
+        Fut: std::future::Future<Output = EventResponse>,
+    {
+        info!("starting Linux input handler");
 
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        // TODO: Implement Linux input handling
+        // Options:
+        // 1. evdev: Read from /dev/input/eventX, grab the device, filter F13-F24
+        // 2. Use libinput for higher-level input handling
+        //
+        // For window queries:
+        // - X11: Use x11rb crate, query _NET_ACTIVE_WINDOW, then WM_NAME, WM_CLASS
+        // - Wayland: More complex, compositor-specific (wlr-foreign-toplevel-management)
+
+        warn!("Linux platform not yet implemented - running placeholder loop");
+
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+    }
+
+    /// Query information about the currently focused window
+    pub fn get_active_window(&self) -> WindowInfo {
+        // TODO: Implement using x11rb
+        // 1. Get root window
+        // 2. Get _NET_ACTIVE_WINDOW property -> active window ID
+        // 3. Get _NET_WM_NAME or WM_NAME property -> title
+        // 4. Get WM_CLASS property -> (instance, class)
+        // 5. Get _NET_WM_PID -> pid -> read /proc/<pid>/exe -> binary name
+        WindowInfo::default()
+    }
+
+    /// Inject a synthetic key press
+    pub fn send_key(&self, key: SyntheticKey) {
+        // TODO: Implement using uinput or xdotool
+        // For browser back/forward, could also send Alt+Left / Alt+Right
+        warn!(?key, "send_key not implemented on Linux");
+    }
+
+    /// Execute a media control command
+    pub fn send_media(&self, cmd: MediaCommand) {
+        // TODO: Implement using D-Bus MPRIS (more reliable than key simulation)
+        // Could use zbus crate for D-Bus, or shell out to playerctl
+        warn!(?cmd, "send_media not implemented on Linux");
     }
 }
 
-/// Query information about the currently focused window (X11)
-fn get_active_window_info_x11() -> WindowInfo {
-    // TODO: Implement using x11rb
-    // 1. Get root window
-    // 2. Get _NET_ACTIVE_WINDOW property -> active window ID
-    // 3. Get _NET_WM_NAME or WM_NAME property -> title
-    // 4. Get WM_CLASS property -> (instance, class)
-    // 5. Get _NET_WM_PID -> pid -> read /proc/<pid>/exe -> binary name
-
-    WindowInfo::default()
+impl Default for Platform {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
-/// Convert evdev key code to our key name
-fn evdev_to_name(code: u16) -> Option<&'static str> {
-    // evdev KEY_F13 through KEY_F24 codes
-    // These are defined in linux/input-event-codes.h
-    match code {
-        183 => Some("f13"), // KEY_F13
-        184 => Some("f14"),
-        185 => Some("f15"),
-        186 => Some("f16"),
-        187 => Some("f17"),
-        188 => Some("f18"),
-        189 => Some("f19"),
-        190 => Some("f20"),
-        191 => Some("f21"),
-        192 => Some("f22"),
-        193 => Some("f23"),
-        194 => Some("f24"),
-        _ => None,
+// Trait impl for compile-time interface verification only
+impl PlatformInterface for Platform {
+    fn new() -> Self {
+        Self::new()
+    }
+
+    async fn run<F, Fut>(&mut self, handler: F) -> Result<()>
+    where
+        F: FnMut(KeyEvent, crate::strategy::PlatformHandle) -> Fut,
+        Fut: std::future::Future<Output = EventResponse>,
+    {
+        Self::run(self, handler).await
+    }
+
+    fn get_active_window(&self) -> WindowInfo {
+        Self::get_active_window(self)
+    }
+
+    fn send_key(&self, key: SyntheticKey) {
+        Self::send_key(self, key)
+    }
+
+    fn send_media(&self, cmd: MediaCommand) {
+        Self::send_media(self, cmd)
     }
 }

@@ -1,34 +1,40 @@
 # rebinded configuration
 # Place at ~/.config/rebinded/config.toml
 
-# Debounce profiles
-# Used for scroll wheel tilt buttons to prevent accidental activation
-[debounce.scroll]
+# Strategy definitions
+# Strategies control how key events are processed before action execution.
+#
+# gated_hold: Requires key to be held before first activation, then allows
+#             rapid re-presses. Good for scroll wheel tilt buttons to prevent
+#             accidental activation while allowing intentional rapid skipping.
+
+[strategies.scroll]
+type = "gated_hold"
 initial_hold_ms = 110      # Must hold for 110ms before first activation
 repeat_window_ms = 2000    # After release, quick re-presses activate immediately for 2 seconds
 
 # Key bindings
-# Keys are lowercase: f13, f14, etc.
-# Actions: media_play_pause, media_next, media_prev, media_stop,
+# Keys are lowercase: F13, F14, etc.
+# Actions: media_play_pause, media_next, media_previous, media_stop,
 #          browser_back, browser_forward, passthrough, block
 
 # Play/Pause - simple action, no conditions
-[bindings.f13]
+[bindings.F13]
 action = "media_play_pause"
 
 # Open for games/scripts - passes F14 through unchanged
-[bindings.f14]
+[bindings.F14]
 action = "passthrough"
 
-# Previous track - uses scroll debounce to prevent accidental bumps
-[bindings.f15]
-action = "media_prev"
-debounce = "scroll"
+# Previous track - uses scroll strategy to prevent accidental bumps
+[bindings.F15]
+action = "media_previous"
+strategy = "scroll"
 
-# Next track - uses scroll debounce
-[bindings.f16]
+# Next track - uses scroll strategy
+[bindings.F16]
 action = "media_next"
-debounce = "scroll"
+strategy = "scroll"
 
 # Forward - context-sensitive: browser forward in Vivaldi/Firefox, passthrough elsewhere
 [bindings.f17]
@@ -41,7 +47,7 @@ action = [
 ]
 
 # Back - context-sensitive
-[bindings.f18]
+[bindings.F18]
 action = [
     { condition = { window = { title = "*Vivaldi*" } }, action = "browser_back" },
     { condition = { window = { title = "*Firefox*" } }, action = "browser_back" },
@@ -56,19 +62,19 @@ action = "passthrough"
 # Examples of other condition patterns:
 
 # Block a key when a specific game is running
-# [bindings.f20]
+# [bindings.F20]
 # action = [
 #     { condition = { window = { binary = "game.exe" } }, action = "block" },
 # ]
 
 # Use negation to enable only when NOT in a game
-# [bindings.f21]
+# [bindings.F21]
 # action = [
 #     { condition = { window = { not_binary = "*game*" } }, action = "media_play_pause" },
 # ]
 
 # Combine positive and negative conditions (AND logic)
-# [bindings.f22]
+# [bindings.F22]
 # action = [
 #     { condition = { window = { title = "*YouTube*", not_binary = "discord*" } }, action = "media_play_pause" },
 # ]

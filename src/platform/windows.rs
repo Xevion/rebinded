@@ -1,87 +1,182 @@
-//! Windows-specific implementation using Win32 low-level keyboard hooks
+//! Windows-specific platform implementation
 //!
-//! Architecture:
-//! - Low-level keyboard hook runs on a dedicated thread (Win32 requires message pump)
-//! - Hook callback checks F13-F24, queries window info, resolves action
-//! - Actions are executed synchronously in the hook (must be fast to avoid input lag)
-//!
-//! Key Win32 APIs:
+//! Uses Win32 low-level keyboard hooks and APIs:
 //! - SetWindowsHookExW(WH_KEYBOARD_LL) for intercepting keys
 //! - GetForegroundWindow + GetWindowTextW for window title
 //! - GetClassNameW for window class
 //! - GetWindowThreadProcessId + OpenProcess + QueryFullProcessImageNameW for binary
+//! - SendInput for synthetic key injection
 
-use crate::config::{Action, Config, WindowInfo};
-use crate::state::{DebounceManager, DebounceResult};
-use anyhow::{anyhow, Result};
+use super::{EventResponse, MediaCommand, PlatformInterface, SyntheticKey};
+use crate::config::WindowInfo;
+use crate::key::{KeyCode, KeyEvent};
+use anyhow::{Result, anyhow};
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
-use std::sync::Mutex;
 use std::sync::OnceLock;
-use tracing::{debug, error, info, trace, warn};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use tokio::sync::mpsc;
+use tracing::{debug, info, trace, warn};
+use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
+    OpenProcess, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
+    INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput,
     VIRTUAL_KEY,
 };
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetClassNameW, GetForegroundWindow, GetMessageW,
-    GetWindowTextW, GetWindowThreadProcessId, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
-    KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    GetWindowTextW, GetWindowThreadProcessId, KBDLLHOOKSTRUCT, MSG, PostThreadMessageW,
+    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_KEYDOWN,
+    WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
+use windows::core::PWSTR;
 
-// Global state - Win32 hooks require static access from callback
-static STATE: OnceLock<Mutex<HookState>> = OnceLock::new();
-
-struct HookState {
-    config: Config,
-    debounce: DebounceManager,
+/// Channel message from hook thread to main thread
+struct HookEvent {
+    event: KeyEvent,
+    response_tx: tokio::sync::oneshot::Sender<EventResponse>,
 }
 
-/// Virtual key codes for F13-F24
-const VK_F13: u32 = 0x7C;
-const VK_F24: u32 = 0x87;
+/// Global state for hook callback (Win32 requires static access)
+static HOOK_CHANNEL: OnceLock<mpsc::UnboundedSender<HookEvent>> = OnceLock::new();
 
-/// Media virtual key codes
-const VK_MEDIA_NEXT_TRACK: u16 = 0xB0;
-const VK_MEDIA_PREV_TRACK: u16 = 0xB1;
-const VK_MEDIA_STOP: u16 = 0xB2;
-const VK_MEDIA_PLAY_PAUSE: u16 = 0xB3;
-const VK_BROWSER_BACK: u16 = 0xA6;
-const VK_BROWSER_FORWARD: u16 = 0xA7;
+/// Thread ID of the hook thread, used to post WM_QUIT for clean shutdown
+static HOOK_THREAD_ID: OnceLock<u32> = OnceLock::new();
 
-pub async fn run(config: Config) -> Result<()> {
-    info!("initializing Windows keyboard hook");
+/// Marker for synthetic key injections so we can skip them in the hook
+const INJECTED_MARKER: usize = u32::from_be_bytes(*b"RBND") as usize;
 
-    // Initialize debounce manager from config
-    let mut debounce = DebounceManager::new();
-    for (name, profile) in &config.debounce {
-        debounce.add_profile(name.clone(), profile.clone());
+/// Windows platform implementation
+pub struct Platform {
+    event_rx: mpsc::UnboundedReceiver<HookEvent>,
+}
+
+// Inherent impl with public methods - this is what external code uses
+impl Platform {
+    /// Create a new platform instance
+    pub fn new() -> Self {
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+
+        // Store sender in global for hook callback access
+        HOOK_CHANNEL
+            .set(event_tx)
+            .expect("Platform::new called multiple times");
+
+        Self { event_rx }
     }
-    for (key, binding) in &config.bindings {
-        if let Some(ref profile_name) = binding.debounce {
-            debounce.set_key_profile(key.clone(), profile_name.clone());
+
+    /// Run the platform event loop with an async handler
+    ///
+    /// Captures keyboard events and calls `handler` for each.
+    /// The handler receives the event and a PlatformHandle for
+    /// querying window info and executing actions.
+    pub async fn run<F, Fut>(&mut self, mut handler: F) -> Result<()>
+    where
+        F: FnMut(KeyEvent, crate::strategy::PlatformHandle) -> Fut,
+        Fut: std::future::Future<Output = EventResponse>,
+    {
+        use crate::strategy::PlatformHandle;
+
+        info!("initializing Windows keyboard hook");
+
+        // Spawn the hook thread (Win32 message pump must run on dedicated thread)
+        let hook_handle = tokio::task::spawn_blocking(run_hook_thread);
+
+        // Create a handle that can be passed to the handler
+        let platform_handle = PlatformHandle::new(self);
+
+        // Process events from hook thread
+        while let Some(hook_event) = self.event_rx.recv().await {
+            let response = handler(hook_event.event, platform_handle).await;
+            // Send response back to hook thread (ignore if receiver dropped)
+            let _ = hook_event.response_tx.send(response);
         }
+
+        // Signal hook thread to exit by posting WM_QUIT
+        if let Some(&thread_id) = HOOK_THREAD_ID.get() {
+            info!("signaling hook thread to exit");
+            unsafe {
+                let _ = PostThreadMessageW(thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
+            }
+        }
+
+        // Wait for hook thread to finish
+        hook_handle.await??;
+        Ok(())
     }
 
-    // Store in global state
-    STATE
-        .set(Mutex::new(HookState { config, debounce }))
-        .map_err(|_| anyhow!("hook state already initialized"))?;
+    /// Query information about the currently focused window
+    pub fn get_active_window(&self) -> WindowInfo {
+        get_foreground_window_info()
+    }
 
-    // Run the hook on a blocking thread (Win32 message pump must be on same thread as hook)
-    let handle = tokio::task::spawn_blocking(|| run_hook_thread());
+    /// Inject a synthetic key press
+    pub fn send_key(&self, key: SyntheticKey) {
+        let vk = match key {
+            SyntheticKey::BrowserBack => 0xA6,    // VK_BROWSER_BACK
+            SyntheticKey::BrowserForward => 0xA7, // VK_BROWSER_FORWARD
+        };
+        send_key_press(vk);
+    }
 
-    handle.await??;
-    Ok(())
+    /// Execute a media control command
+    pub fn send_media(&self, cmd: MediaCommand) {
+        let vk = match cmd {
+            MediaCommand::PlayPause => 0xB3, // VK_MEDIA_PLAY_PAUSE
+            MediaCommand::Next => 0xB0,      // VK_MEDIA_NEXT_TRACK
+            MediaCommand::Previous => 0xB1,  // VK_MEDIA_PREV_TRACK
+            MediaCommand::Stop => 0xB2,      // VK_MEDIA_STOP
+        };
+        send_key_press(vk);
+    }
 }
+
+impl Default for Platform {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// Trait impl for compile-time interface verification only
+impl PlatformInterface for Platform {
+    fn new() -> Self {
+        Self::new()
+    }
+
+    async fn run<F, Fut>(&mut self, handler: F) -> Result<()>
+    where
+        F: FnMut(KeyEvent, crate::strategy::PlatformHandle) -> Fut,
+        Fut: std::future::Future<Output = EventResponse>,
+    {
+        Self::run(self, handler).await
+    }
+
+    fn get_active_window(&self) -> WindowInfo {
+        Self::get_active_window(self)
+    }
+
+    fn send_key(&self, key: SyntheticKey) {
+        Self::send_key(self, key)
+    }
+
+    fn send_media(&self, cmd: MediaCommand) {
+        Self::send_media(self, cmd)
+    }
+}
+
+// ============================================================================
+// Hook Thread
+// ============================================================================
 
 /// Runs the Win32 message pump - must be called from a dedicated thread
 fn run_hook_thread() -> Result<()> {
     unsafe {
+        // Store thread ID so main thread can signal us to exit
+        let thread_id = GetCurrentThreadId();
+        let _ = HOOK_THREAD_ID.set(thread_id);
+
         // Install low-level keyboard hook
         let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), None, 0)
             .map_err(|e| anyhow!("failed to install keyboard hook: {}", e))?;
@@ -89,6 +184,7 @@ fn run_hook_thread() -> Result<()> {
         info!("keyboard hook installed, starting message pump");
 
         // Message pump - required for low-level hooks to work
+        // Exits when WM_QUIT is received (GetMessageW returns false)
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             let _ = TranslateMessage(&msg);
@@ -105,167 +201,75 @@ fn run_hook_thread() -> Result<()> {
 
 /// Low-level keyboard hook callback
 /// SAFETY: Called by Windows from the message pump thread
-unsafe extern "system" fn keyboard_hook_proc(
-    code: i32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
+unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     // code < 0 means we must pass to next hook without processing
     if code < 0 {
-        return CallNextHookEx(None, code, wparam, lparam);
+        // SAFETY: Windows requires us to call the next hook
+        return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
 
-    let kb_struct = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+    // SAFETY: lparam points to a valid KBDLLHOOKSTRUCT when code >= 0
+    let kb_struct = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+
+    // Skip our own synthetic injections
+    if kb_struct.dwExtraInfo == INJECTED_MARKER {
+        return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+    }
+
     let vk = kb_struct.vkCode;
-
-    // Only process F13-F24
-    if vk < VK_F13 || vk > VK_F24 {
-        return CallNextHookEx(None, code, wparam, lparam);
-    }
 
     let is_keydown = matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
     let is_keyup = matches!(wparam.0 as u32, WM_KEYUP | WM_SYSKEYUP);
 
     if !is_keydown && !is_keyup {
-        return CallNextHookEx(None, code, wparam, lparam);
+        // SAFETY: Windows requires us to call the next hook
+        return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
 
-    let key_name = vk_to_name(vk);
-    trace!(vk, key_name, is_keydown, "hook received key event");
+    let key_code = KeyCode::new(vk);
+    trace!(?key_code, is_keydown, "hook received key event");
 
-    // Process through our handler
-    let should_block = process_key_event(key_name, vk, is_keydown);
+    // Try to send event to main thread and wait for response
+    let should_block = process_hook_event(key_code, is_keydown);
 
     if should_block {
         // Return non-zero to block the key from propagating
         LRESULT(1)
     } else {
-        // Pass to next hook
-        CallNextHookEx(None, code, wparam, lparam)
+        // SAFETY: Windows requires us to call the next hook
+        unsafe { CallNextHookEx(None, code, wparam, lparam) }
     }
 }
 
-/// Process a key event and determine if it should be blocked
-/// Returns true if the key should be blocked (not passed to applications)
-fn process_key_event(key_name: &str, _vk: u32, is_keydown: bool) -> bool {
-    let Some(state) = STATE.get() else {
-        warn!("hook state not initialized");
+/// Send event to main thread and wait for response
+fn process_hook_event(key_code: KeyCode, is_keydown: bool) -> bool {
+    let Some(tx) = HOOK_CHANNEL.get() else {
         return false;
     };
 
-    let mut state = match state.lock() {
-        Ok(s) => s,
-        Err(e) => {
-            error!("failed to lock hook state: {}", e);
-            return false;
-        }
-    };
+    let event = KeyEvent::new(key_code, is_keydown);
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
 
-    // Process through debounce state machine
-    let debounce_result = if is_keydown {
-        state.debounce.key_down(key_name)
-    } else {
-        state.debounce.key_up(key_name)
-    };
+    // Send event to main thread
+    if tx.send(HookEvent { event, response_tx }).is_err() {
+        debug!("hook channel closed");
+        return false;
+    }
 
-    match debounce_result {
-        DebounceResult::Passthrough => {
-            // No debounce configured, check config directly
-            if !is_keydown {
-                // We typically only act on key-down for non-debounced keys
-                return false;
-            }
-            process_action(&state.config, key_name)
-        }
-        DebounceResult::Activate => {
-            debug!(key_name, "debounce activated");
-            process_action(&state.config, key_name)
-        }
-        DebounceResult::Suppress => {
-            trace!(key_name, "debounce suppressed");
-            true // Block the key
+    // Block waiting for response (we're on hook thread, not async)
+    match response_rx.blocking_recv() {
+        Ok(EventResponse::Block) => true,
+        Ok(EventResponse::Passthrough) => false,
+        Err(_) => {
+            debug!("response channel closed");
+            false
         }
     }
 }
 
-/// Look up and execute the action for a key
-/// Returns true if the key should be blocked
-fn process_action(config: &Config, key_name: &str) -> bool {
-    let window_info = get_foreground_window_info();
-    debug!(?window_info, key_name, "resolving action");
-
-    let action = config.resolve_action(key_name, &window_info);
-
-    match action {
-        Some(Action::Passthrough) | None => {
-            debug!(key_name, "passthrough");
-            false // Don't block
-        }
-        Some(Action::Block) => {
-            debug!(key_name, "blocked");
-            true
-        }
-        Some(action) => {
-            debug!(key_name, ?action, "executing action");
-            execute_action_sync(action);
-            true // Block original key
-        }
-    }
-}
-
-/// Execute an action synchronously (we're in the hook callback, can't await)
-fn execute_action_sync(action: &Action) {
-    match action {
-        Action::MediaPlayPause => send_media_key(VK_MEDIA_PLAY_PAUSE),
-        Action::MediaNext => send_media_key(VK_MEDIA_NEXT_TRACK),
-        Action::MediaPrevious => send_media_key(VK_MEDIA_PREV_TRACK),
-        Action::MediaStop => send_media_key(VK_MEDIA_STOP),
-        Action::BrowserBack => send_media_key(VK_BROWSER_BACK),
-        Action::BrowserForward => send_media_key(VK_BROWSER_FORWARD),
-        Action::Passthrough | Action::Block => {}
-    }
-}
-
-/// Send a virtual key press using SendInput
-fn send_media_key(vk: u16) {
-    unsafe {
-        let inputs = [
-            // Key down
-            INPUT {
-                r#type: INPUT_KEYBOARD,
-                Anonymous: INPUT_0 {
-                    ki: KEYBDINPUT {
-                        wVk: VIRTUAL_KEY(vk),
-                        wScan: 0,
-                        dwFlags: KEYBD_EVENT_FLAGS(0),
-                        time: 0,
-                        dwExtraInfo: 0,
-                    },
-                },
-            },
-            // Key up
-            INPUT {
-                r#type: INPUT_KEYBOARD,
-                Anonymous: INPUT_0 {
-                    ki: KEYBDINPUT {
-                        wVk: VIRTUAL_KEY(vk),
-                        wScan: 0,
-                        dwFlags: KEYEVENTF_KEYUP,
-                        time: 0,
-                        dwExtraInfo: 0,
-                    },
-                },
-            },
-        ];
-
-        let sent = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
-        if sent != 2 {
-            warn!(vk, sent, "SendInput did not send all events");
-        } else {
-            trace!(vk, "sent media key");
-        }
-    }
-}
+// ============================================================================
+// Window Queries
+// ============================================================================
 
 /// Query information about the currently focused window
 fn get_foreground_window_info() -> WindowInfo {
@@ -286,7 +290,8 @@ fn get_foreground_window_info() -> WindowInfo {
 /// Get the window title
 unsafe fn get_window_title(hwnd: HWND) -> String {
     let mut buffer = [0u16; 512];
-    let len = GetWindowTextW(hwnd, &mut buffer);
+    // SAFETY: hwnd is a valid window handle, buffer is correctly sized
+    let len = unsafe { GetWindowTextW(hwnd, &mut buffer) };
     if len > 0 {
         OsString::from_wide(&buffer[..len as usize])
             .to_string_lossy()
@@ -299,7 +304,8 @@ unsafe fn get_window_title(hwnd: HWND) -> String {
 /// Get the window class name
 unsafe fn get_window_class(hwnd: HWND) -> String {
     let mut buffer = [0u16; 256];
-    let len = GetClassNameW(hwnd, &mut buffer);
+    // SAFETY: hwnd is a valid window handle, buffer is correctly sized
+    let len = unsafe { GetClassNameW(hwnd, &mut buffer) };
     if len > 0 {
         OsString::from_wide(&buffer[..len as usize])
             .to_string_lossy()
@@ -311,22 +317,33 @@ unsafe fn get_window_class(hwnd: HWND) -> String {
 
 /// Get the executable name for the window's process
 unsafe fn get_window_binary(hwnd: HWND) -> String {
-    use windows::core::PWSTR;
-
     let mut pid = 0u32;
-    GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    // SAFETY: hwnd is a valid window handle
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
     if pid == 0 {
         return String::new();
     }
 
-    let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+    // SAFETY: pid is a valid process ID obtained from GetWindowThreadProcessId
+    let Ok(process) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) })
+    else {
         return String::new();
     };
 
     let mut buffer = [0u16; 512];
     let mut size = buffer.len() as u32;
 
-    if QueryFullProcessImageNameW(process, PROCESS_NAME_FORMAT(0), PWSTR(buffer.as_mut_ptr()), &mut size).is_ok() {
+    // SAFETY: process is a valid handle, buffer and size are correctly initialized
+    let result = if unsafe {
+        QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_FORMAT(0),
+            PWSTR(buffer.as_mut_ptr()),
+            &mut size,
+        )
+    }
+    .is_ok()
+    {
         let path = OsString::from_wide(&buffer[..size as usize])
             .to_string_lossy()
             .into_owned();
@@ -335,24 +352,63 @@ unsafe fn get_window_binary(hwnd: HWND) -> String {
         path.rsplit('\\').next().unwrap_or(&path).to_string()
     } else {
         String::new()
-    }
+    };
+
+    // SAFETY: process is a valid handle that we opened
+    let _ = unsafe { CloseHandle(process) };
+
+    result
 }
 
-/// Convert a Windows virtual key code to our key name
-fn vk_to_name(vk: u32) -> &'static str {
-    match vk {
-        0x7C => "f13",
-        0x7D => "f14",
-        0x7E => "f15",
-        0x7F => "f16",
-        0x80 => "f17",
-        0x81 => "f18",
-        0x82 => "f19",
-        0x83 => "f20",
-        0x84 => "f21",
-        0x85 => "f22",
-        0x86 => "f23",
-        0x87 => "f24",
-        _ => "unknown",
+// ============================================================================
+// Synthetic Input
+// ============================================================================
+
+/// Send a synthetic key press (key down + key up)
+///
+/// Spawns a thread to avoid blocking - some keys (especially media keys)
+/// can block SendInput for 600ms+ while Windows processes them.
+fn send_key_press(vk: u16) {
+    std::thread::spawn(move || send_key_press_sync(vk));
+}
+
+/// Synchronous implementation of key press
+fn send_key_press_sync(vk: u16) {
+    unsafe {
+        let inputs = [
+            // Key down
+            INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VIRTUAL_KEY(vk),
+                        wScan: 0,
+                        dwFlags: KEYBD_EVENT_FLAGS(0),
+                        time: 0,
+                        dwExtraInfo: INJECTED_MARKER,
+                    },
+                },
+            },
+            // Key up
+            INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VIRTUAL_KEY(vk),
+                        wScan: 0,
+                        dwFlags: KEYEVENTF_KEYUP,
+                        time: 0,
+                        dwExtraInfo: INJECTED_MARKER,
+                    },
+                },
+            },
+        ];
+
+        let sent = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+        if sent != 2 {
+            warn!(vk, sent, "SendInput did not send all events");
+        } else {
+            trace!(vk, "sent synthetic key");
+        }
     }
 }
