@@ -1,21 +1,11 @@
 //! Debounce state machine
 //!
-//! Implements the two-phase debounce logic:
+//! Implements the two-phase debounce logic with shared group state:
 //! 1. Initial gate: Key must be held for `initial_hold_ms` before first activation
-//! 2. Repeat window: After activation, subsequent presses within `repeat_window_ms` activate immediately
+//! 2. Repeat window: After activation, ANY key in the same group activates immediately
 //!
-//! State transitions:
-//! ```text
-//!                    key_down
-//!     ┌─────────────────────────────────────┐
-//!     │                                     ▼
-//!   Idle ──key_down──▶ Holding ──timeout──▶ Active ──key_up──▶ Cooldown
-//!     ▲                   │                   │                   │
-//!     │                   │ key_up            │ key_down          │ timeout
-//!     │                   │ (cancel)          │ (repeat)          │
-//!     │                   ▼                   ▼                   │
-//!     └───────────────── Idle ◀────────────────────────────────────┘
-//! ```
+//! Keys sharing the same debounce profile share gate state. For example, scroll left/right
+//! (F15/F16) both use the "scroll" profile, so holding F15 unlocks the gate for F16 too.
 
 use crate::config::DebounceProfile;
 use std::collections::HashMap;
@@ -23,16 +13,22 @@ use std::time::{Duration, Instant};
 use tracing::debug;
 
 /// Tracks debounce state for a single key
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum KeyState {
     /// No activity, waiting for key press
     Idle,
     /// Key is held, waiting for initial_hold_ms to activate
     Holding { since: Instant },
-    /// Key was activated, in repeat window
-    Active { last_activation: Instant },
-    /// Key released after activation, in cooldown before returning to idle
-    Cooldown { since: Instant },
+    /// Key was activated and is being held
+    Active,
+}
+
+/// Tracks shared state for a debounce group (all keys sharing a profile)
+/// The gate is "open" if any key is Active OR we're within repeat_window of last release
+#[derive(Debug, Clone, Default)]
+struct GroupState {
+    /// When a key in this group was last released (for repeat window)
+    last_release: Option<Instant>,
 }
 
 /// Result of processing a key event through the debounce state machine
@@ -46,18 +42,23 @@ pub enum DebounceResult {
     Passthrough,
 }
 
-/// Manages debounce state for multiple keys
+/// Manages debounce state for multiple keys with shared group state
 pub struct DebounceManager {
-    states: HashMap<String, KeyState>,
+    /// Per-key state (holding, active, etc.)
+    key_states: HashMap<String, KeyState>,
+    /// Per-group state (gate open/closed, last activation time)
+    group_states: HashMap<String, GroupState>,
+    /// Debounce profiles by name
     profiles: HashMap<String, DebounceProfile>,
-    /// Maps key names to their debounce profile names
+    /// Maps key names to their debounce profile/group names
     key_profiles: HashMap<String, String>,
 }
 
 impl DebounceManager {
     pub fn new() -> Self {
         Self {
-            states: HashMap::new(),
+            key_states: HashMap::new(),
+            group_states: HashMap::new(),
             profiles: HashMap::new(),
             key_profiles: HashMap::new(),
         }
@@ -68,91 +69,118 @@ impl DebounceManager {
         self.profiles.insert(name, profile);
     }
 
-    /// Associate a key with a debounce profile
+    /// Associate a key with a debounce profile (group)
     pub fn set_key_profile(&mut self, key: String, profile_name: String) {
         self.key_profiles.insert(key, profile_name);
     }
 
+    /// Check if a group's gate is open
+    /// Gate is open if: any key in group is Active, OR within repeat_window of last release
+    fn is_gate_open(&self, group_name: &str, profile: &DebounceProfile) -> bool {
+        // Check if any key in this group is currently active
+        let any_active = self.key_states.iter().any(|(k, s)| {
+            matches!(s, KeyState::Active) && self.key_profiles.get(k).map(|s| s.as_str()) == Some(group_name)
+        });
+        if any_active {
+            return true;
+        }
+
+        // Check if we're in the repeat window after last release
+        if let Some(group) = self.group_states.get(group_name) {
+            if let Some(last) = group.last_release {
+                let repeat_window = Duration::from_millis(profile.repeat_window_ms);
+                if last.elapsed() < repeat_window {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
     /// Process a key-down event
     pub fn key_down(&mut self, key: &str) -> DebounceResult {
-        let Some(profile_name) = self.key_profiles.get(key) else {
+        let Some(group_name) = self.key_profiles.get(key).cloned() else {
             return DebounceResult::Passthrough;
         };
-        let Some(profile) = self.profiles.get(profile_name) else {
+        let Some(profile) = self.profiles.get(&group_name).cloned() else {
             return DebounceResult::Passthrough;
         };
 
         let now = Instant::now();
         let initial_hold = Duration::from_millis(profile.initial_hold_ms);
-        let repeat_window = Duration::from_millis(profile.repeat_window_ms);
 
-        let state = self.states.entry(key.to_string()).or_insert(KeyState::Idle);
+        // Check gate status before borrowing key_states mutably
+        let gate_open = self.is_gate_open(&group_name, &profile);
 
-        match state {
+        // Get current key state
+        let current_state = self
+            .key_states
+            .get(key)
+            .cloned()
+            .unwrap_or(KeyState::Idle);
+
+        match current_state {
             KeyState::Idle => {
-                debug!(key, "debounce: idle -> holding");
-                *state = KeyState::Holding { since: now };
-                DebounceResult::Suppress
+                if gate_open {
+                    debug!(key, group = %group_name, "debounce: idle -> active (gate open)");
+                    self.key_states.insert(key.to_string(), KeyState::Active);
+                    DebounceResult::Activate
+                } else {
+                    debug!(key, group = %group_name, "debounce: idle -> holding");
+                    self.key_states
+                        .insert(key.to_string(), KeyState::Holding { since: now });
+                    DebounceResult::Suppress
+                }
             }
             KeyState::Holding { since } => {
-                if now.duration_since(*since) >= initial_hold {
-                    debug!(key, "debounce: holding -> active (initial hold complete)");
-                    *state = KeyState::Active {
-                        last_activation: now,
-                    };
+                if gate_open {
+                    debug!(key, group = %group_name, "debounce: holding -> active (gate open)");
+                    self.key_states.insert(key.to_string(), KeyState::Active);
+                    DebounceResult::Activate
+                } else if now.duration_since(since) >= initial_hold {
+                    debug!(key, group = %group_name, "debounce: holding -> active (hold complete)");
+                    self.key_states.insert(key.to_string(), KeyState::Active);
                     DebounceResult::Activate
                 } else {
                     DebounceResult::Suppress
                 }
             }
-            KeyState::Active { last_activation } => {
-                // Rapid repeat while in active state
-                debug!(key, "debounce: active repeat");
-                *last_activation = now;
-                DebounceResult::Activate
-            }
-            KeyState::Cooldown { since } => {
-                if now.duration_since(*since) < repeat_window {
-                    // Still in repeat window, activate immediately
-                    debug!(key, "debounce: cooldown -> active (repeat window)");
-                    *state = KeyState::Active {
-                        last_activation: now,
-                    };
-                    DebounceResult::Activate
-                } else {
-                    // Repeat window expired, start fresh
-                    debug!(key, "debounce: cooldown -> holding (window expired)");
-                    *state = KeyState::Holding { since: now };
-                    DebounceResult::Suppress
-                }
+            KeyState::Active => {
+                // Key is being held down, suppress repeated key-down events
+                DebounceResult::Suppress
             }
         }
     }
 
     /// Process a key-up event
     pub fn key_up(&mut self, key: &str) -> DebounceResult {
-        if !self.key_profiles.contains_key(key) {
+        let Some(group_name) = self.key_profiles.get(key).cloned() else {
             return DebounceResult::Passthrough;
-        }
+        };
 
         let now = Instant::now();
-        let state = self.states.entry(key.to_string()).or_insert(KeyState::Idle);
+        let key_state = self
+            .key_states
+            .entry(key.to_string())
+            .or_insert(KeyState::Idle);
 
-        match state {
+        match key_state {
             KeyState::Holding { .. } => {
-                // Released before activation threshold
-                debug!(key, "debounce: holding -> idle (cancelled)");
-                *state = KeyState::Idle;
+                debug!(key, group = %group_name, "debounce: holding -> idle (cancelled)");
+                *key_state = KeyState::Idle;
             }
-            KeyState::Active { .. } => {
-                // Enter cooldown for potential rapid repeats
-                debug!(key, "debounce: active -> cooldown");
-                *state = KeyState::Cooldown { since: now };
+            KeyState::Active => {
+                debug!(key, group = %group_name, "debounce: active -> idle");
+                *key_state = KeyState::Idle;
+
+                // Record release time for repeat window
+                let group = self.group_states.entry(group_name).or_default();
+                group.last_release = Some(now);
             }
-            _ => {}
+            KeyState::Idle => {}
         }
 
-        // Key-up events are always suppressed for debounced keys
         DebounceResult::Suppress
     }
 
@@ -162,54 +190,58 @@ impl DebounceManager {
         let now = Instant::now();
         let mut to_activate = Vec::new();
 
-        for (key, state) in &mut self.states {
-            if let KeyState::Holding { since } = state {
-                let profile_name = match self.key_profiles.get(key) {
-                    Some(p) => p,
-                    None => continue,
-                };
-                let profile = match self.profiles.get(profile_name) {
-                    Some(p) => p,
-                    None => continue,
-                };
-
-                let initial_hold = Duration::from_millis(profile.initial_hold_ms);
-                if now.duration_since(*since) >= initial_hold {
-                    debug!(key, "debounce: tick -> activate");
-                    *state = KeyState::Active {
-                        last_activation: now,
-                    };
-                    to_activate.push(key.clone());
+        // Collect keys that need activation
+        let keys_to_check: Vec<_> = self
+            .key_states
+            .iter()
+            .filter_map(|(key, state)| {
+                if let KeyState::Holding { since } = state {
+                    Some((key.clone(), *since))
+                } else {
+                    None
                 }
+            })
+            .collect();
+
+        for (key, since) in keys_to_check {
+            let Some(group_name) = self.key_profiles.get(&key) else {
+                continue;
+            };
+            let Some(profile) = self.profiles.get(group_name) else {
+                continue;
+            };
+
+            let initial_hold = Duration::from_millis(profile.initial_hold_ms);
+            if now.duration_since(since) >= initial_hold {
+                debug!(key, "debounce: tick -> activate");
+
+                if let Some(state) = self.key_states.get_mut(&key) {
+                    *state = KeyState::Active;
+                }
+
+                to_activate.push(key);
             }
         }
 
         to_activate
     }
 
-    /// Clean up expired cooldown states
+    /// Clean up expired group states
     pub fn cleanup(&mut self) {
         let now = Instant::now();
 
-        self.states.retain(|key, state| {
-            if let KeyState::Cooldown { since } = state {
-                let profile_name = match self.key_profiles.get(key) {
-                    Some(p) => p,
-                    None => return false,
+        for (group_name, group) in &mut self.group_states {
+            if let Some(last) = group.last_release {
+                let Some(profile) = self.profiles.get(group_name) else {
+                    continue;
                 };
-                let profile = match self.profiles.get(profile_name) {
-                    Some(p) => p,
-                    None => return false,
-                };
-
                 let repeat_window = Duration::from_millis(profile.repeat_window_ms);
-                if now.duration_since(*since) >= repeat_window {
-                    debug!(key, "debounce: cooldown expired, removing state");
-                    return false;
+                if now.duration_since(last) >= repeat_window {
+                    debug!(group = %group_name, "debounce: repeat window expired");
+                    group.last_release = None;
                 }
             }
-            true
-        });
+        }
     }
 }
 
@@ -268,7 +300,7 @@ mod tests {
     }
 
     #[test]
-    fn test_repeat_in_window() {
+    fn test_repeat_in_window_same_key() {
         let mut manager = DebounceManager::new();
         manager.add_profile("scroll".to_string(), test_profile());
         manager.set_key_profile("f15".to_string(), "scroll".to_string());
@@ -307,6 +339,104 @@ mod tests {
         sleep(Duration::from_millis(60));
 
         // Should need to hold again
+        assert!(manager.key_down("f15") == DebounceResult::Suppress);
+    }
+
+    #[test]
+    fn test_shared_group_gate_opens_for_sibling() {
+        let mut manager = DebounceManager::new();
+        manager.add_profile("scroll".to_string(), test_profile());
+        manager.set_key_profile("f15".to_string(), "scroll".to_string());
+        manager.set_key_profile("f16".to_string(), "scroll".to_string());
+
+        // F15 starts holding
+        assert!(manager.key_down("f15") == DebounceResult::Suppress);
+
+        // Wait for threshold, F15 activates and opens gate
+        sleep(Duration::from_millis(60));
+        assert!(manager.key_down("f15") == DebounceResult::Activate);
+
+        // F16 should activate immediately (gate is open)
+        assert!(manager.key_down("f16") == DebounceResult::Activate);
+    }
+
+    #[test]
+    fn test_shared_group_repeat_window_works_for_sibling() {
+        let mut manager = DebounceManager::new();
+        manager.add_profile("scroll".to_string(), test_profile());
+        manager.set_key_profile("f15".to_string(), "scroll".to_string());
+        manager.set_key_profile("f16".to_string(), "scroll".to_string());
+
+        // F15 activates
+        manager.key_down("f15");
+        sleep(Duration::from_millis(60));
+        assert!(manager.key_down("f15") == DebounceResult::Activate);
+        manager.key_up("f15");
+
+        // F16 should activate immediately (in repeat window)
+        assert!(manager.key_down("f16") == DebounceResult::Activate);
+    }
+
+    #[test]
+    fn test_shared_group_both_keys_active_keeps_gate_open() {
+        let mut manager = DebounceManager::new();
+        manager.add_profile("scroll".to_string(), test_profile());
+        manager.set_key_profile("f15".to_string(), "scroll".to_string());
+        manager.set_key_profile("f16".to_string(), "scroll".to_string());
+
+        // F15 activates
+        manager.key_down("f15");
+        sleep(Duration::from_millis(60));
+        assert!(manager.key_down("f15") == DebounceResult::Activate);
+
+        // F16 activates while F15 still held
+        assert!(manager.key_down("f16") == DebounceResult::Activate);
+
+        // Release F15, but F16 still held - gate should stay open
+        manager.key_up("f15");
+
+        // Release F16, now gate closes but repeat window active
+        manager.key_up("f16");
+
+        // F15 should still activate immediately (repeat window)
+        assert!(manager.key_down("f15") == DebounceResult::Activate);
+    }
+
+    #[test]
+    fn test_independent_groups() {
+        let mut manager = DebounceManager::new();
+        manager.add_profile("scroll".to_string(), test_profile());
+        manager.add_profile("other".to_string(), test_profile());
+        manager.set_key_profile("f15".to_string(), "scroll".to_string());
+        manager.set_key_profile("f16".to_string(), "scroll".to_string());
+        manager.set_key_profile("f17".to_string(), "other".to_string());
+
+        // F15 activates (scroll group)
+        manager.key_down("f15");
+        sleep(Duration::from_millis(60));
+        assert!(manager.key_down("f15") == DebounceResult::Activate);
+
+        // F16 activates immediately (same group)
+        assert!(manager.key_down("f16") == DebounceResult::Activate);
+
+        // F17 should still need to hold (different group)
+        assert!(manager.key_down("f17") == DebounceResult::Suppress);
+    }
+
+    #[test]
+    fn test_no_repeat_on_held_key() {
+        let mut manager = DebounceManager::new();
+        manager.add_profile("scroll".to_string(), test_profile());
+        manager.set_key_profile("f15".to_string(), "scroll".to_string());
+
+        // Activate
+        manager.key_down("f15");
+        sleep(Duration::from_millis(60));
+        assert!(manager.key_down("f15") == DebounceResult::Activate);
+
+        // Continued holding should suppress (not spam activations)
+        assert!(manager.key_down("f15") == DebounceResult::Suppress);
+        assert!(manager.key_down("f15") == DebounceResult::Suppress);
         assert!(manager.key_down("f15") == DebounceResult::Suppress);
     }
 }

@@ -4,8 +4,8 @@
 # Debounce profiles
 # Used for scroll wheel tilt buttons to prevent accidental activation
 [debounce.scroll]
-initial_hold_ms = 150      # Must hold for 150ms before first activation
-repeat_window_ms = 2000    # After activation, rapid repeats work for 2 seconds
+initial_hold_ms = 110      # Must hold for 110ms before first activation
+repeat_window_ms = 2000    # After release, quick re-presses activate immediately for 2 seconds
 
 # Key bindings
 # Keys are lowercase: f13, f14, etc.
@@ -30,23 +30,23 @@ debounce = "scroll"
 action = "media_next"
 debounce = "scroll"
 
-# Back - context-sensitive: browser back in Vivaldi/Firefox, passthrough elsewhere
+# Forward - context-sensitive: browser forward in Vivaldi/Firefox, passthrough elsewhere
 [bindings.f17]
-action = [
-    { condition = { window = { title = "*Vivaldi*" } }, action = "browser_back" },
-    { condition = { window = { title = "*Firefox*" } }, action = "browser_back" },
-    { condition = { window = { binary = "vivaldi*" } }, action = "browser_back" },
-    { condition = { window = { binary = "firefox*" } }, action = "browser_back" },
-    # No condition = implicit passthrough
-]
-
-# Forward - context-sensitive
-[bindings.f18]
 action = [
     { condition = { window = { title = "*Vivaldi*" } }, action = "browser_forward" },
     { condition = { window = { title = "*Firefox*" } }, action = "browser_forward" },
     { condition = { window = { binary = "vivaldi*" } }, action = "browser_forward" },
     { condition = { window = { binary = "firefox*" } }, action = "browser_forward" },
+    # No condition = implicit passthrough
+]
+
+# Back - context-sensitive
+[bindings.f18]
+action = [
+    { condition = { window = { title = "*Vivaldi*" } }, action = "browser_back" },
+    { condition = { window = { title = "*Firefox*" } }, action = "browser_back" },
+    { condition = { window = { binary = "vivaldi*" } }, action = "browser_back" },
+    { condition = { window = { binary = "firefox*" } }, action = "browser_back" },
 ]
 
 # Open for games/scripts
