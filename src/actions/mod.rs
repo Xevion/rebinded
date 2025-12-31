@@ -17,7 +17,7 @@ pub async fn execute(action: &Action) -> Result<()> {
     match action {
         Action::MediaPlayPause => media::play_pause().await,
         Action::MediaNext => media::next_track().await,
-        Action::MediaPrev => media::prev_track().await,
+        Action::MediaPrevious => media::prev_track().await,
         Action::MediaStop => media::stop().await,
         Action::BrowserBack => keys::browser_back().await,
         Action::BrowserForward => keys::browser_forward().await,

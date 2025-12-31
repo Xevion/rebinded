@@ -218,7 +218,7 @@ fn execute_action_sync(action: &Action) {
     match action {
         Action::MediaPlayPause => send_media_key(VK_MEDIA_PLAY_PAUSE),
         Action::MediaNext => send_media_key(VK_MEDIA_NEXT_TRACK),
-        Action::MediaPrev => send_media_key(VK_MEDIA_PREV_TRACK),
+        Action::MediaPrevious => send_media_key(VK_MEDIA_PREV_TRACK),
         Action::MediaStop => send_media_key(VK_MEDIA_STOP),
         Action::BrowserBack => send_media_key(VK_BROWSER_BACK),
         Action::BrowserForward => send_media_key(VK_BROWSER_FORWARD),

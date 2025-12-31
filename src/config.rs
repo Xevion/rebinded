@@ -151,7 +151,7 @@ pub enum Action {
     // Media actions
     MediaPlayPause,
     MediaNext,
-    MediaPrev,
+    MediaPrevious,
     MediaStop,
 
     // Browser actions
@@ -317,7 +317,7 @@ mod tests {
             repeat_window_ms = 2000
 
             [bindings.f15]
-            action = "media_prev"
+            action = "media_previous"
             debounce = "scroll"
         "#;
         let config: Config = toml::from_str(toml).unwrap();
