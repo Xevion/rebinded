@@ -10,6 +10,10 @@ clippy *args:
 check *args:
     @just clippy {{args}}
 
+# Run clippy for Windows target
+check-win *args:
+    cargo clippy --all-targets --all-features --target x86_64-pc-windows-msvc {{args}}
+
 # Run tests
 test *args:
     cargo nextest run {{args}}
