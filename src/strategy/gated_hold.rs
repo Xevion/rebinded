@@ -100,10 +100,7 @@ impl GatedHoldStrategy {
         let gate_open = self.is_gate_open();
 
         // Get current state, defaulting to Idle
-        let current_state = self
-            .key_states
-            .remove(key_name)
-            .unwrap_or(KeyState::Idle);
+        let current_state = self.key_states.remove(key_name).unwrap_or(KeyState::Idle);
 
         match current_state {
             KeyState::Idle => {
@@ -161,10 +158,7 @@ impl GatedHoldStrategy {
 
     /// Handle key-up event
     pub(crate) fn key_up(&mut self, key_name: &str) -> EventResponse {
-        let current_state = self
-            .key_states
-            .remove(key_name)
-            .unwrap_or(KeyState::Idle);
+        let current_state = self.key_states.remove(key_name).unwrap_or(KeyState::Idle);
 
         match current_state {
             KeyState::Holding { cancel_tx } => {
@@ -249,7 +243,9 @@ mod tests {
         let mut strategy = GatedHoldStrategy::new(test_config());
 
         // Set up key in Active state
-        strategy.key_states.insert("f15".to_string(), KeyState::Active);
+        strategy
+            .key_states
+            .insert("f15".to_string(), KeyState::Active);
 
         // Call the actual key_up method
         let response = strategy.key_up("f15");
@@ -267,7 +263,9 @@ mod tests {
 
         // Simulate multiple keys going through Active -> release cycle
         for key in ["f15", "f16", "f17", "f18"] {
-            strategy.key_states.insert(key.to_string(), KeyState::Active);
+            strategy
+                .key_states
+                .insert(key.to_string(), KeyState::Active);
             strategy.key_up(key);
         }
 

@@ -108,7 +108,11 @@ impl ConfigValidationError {
     /// Create a validation error from collected issues
     ///
     /// Issues are sorted by source position for deterministic output.
-    pub fn new(source_name: impl Into<String>, source_content: String, mut issues: Vec<ConfigIssue>) -> Self {
+    pub fn new(
+        source_name: impl Into<String>,
+        source_content: String,
+        mut issues: Vec<ConfigIssue>,
+    ) -> Self {
         // Sort by span start for deterministic, readable output
         issues.sort_by_key(|i| i.span.start);
 
@@ -164,7 +168,11 @@ impl ConfigError {
         }
     }
 
-    pub fn parse(source_name: impl Into<String>, source_content: String, err: toml::de::Error) -> Self {
+    pub fn parse(
+        source_name: impl Into<String>,
+        source_content: String,
+        err: toml::de::Error,
+    ) -> Self {
         let name: String = source_name.into();
         Self::Parse {
             src: NamedSource::new(name, source_content),

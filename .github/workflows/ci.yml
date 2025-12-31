@@ -26,15 +26,22 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Check formatting
-        run: cargo fmt --all -- --check
+        run: |
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            cargo fmt --all -- --check
+          else
+            cargo fmt --all -- --check || echo "::warning::Formatting issues found (not failing on push)"
+          fi
 
       - name: Clippy
-        run: cargo clippy --all-features 2>&1 | tee clippy-output.txt || true
-
-      - name: Annotate clippy warnings
         run: |
-          if grep -q "^warning:" clippy-output.txt; then
-            echo "::warning::Clippy produced warnings. See job output for details."
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            cargo clippy --all-features -- -D warnings
+          else
+            cargo clippy --all-features 2>&1 | tee clippy-output.txt || true
+            if grep -q "^warning:" clippy-output.txt 2>/dev/null; then
+              echo "::warning::Clippy produced warnings (not failing on push)"
+            fi
           fi
 
       - name: Check
