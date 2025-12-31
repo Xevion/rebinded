@@ -1,0 +1,38 @@
+[package]
+name = "rebinded"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "rebinded"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+anyhow = "1"
+glob-match = "0.2"
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(unix)'.dependencies]
+# Linux input handling - will add evdev, x11rb or similar as needed
+
+[dev-dependencies]
+assert2 = "0.3"
+
+[profile.release]
+lto = true
+strip = true

@@ -1,0 +1,74 @@
+# rebinded configuration
+# Place at ~/.config/rebinded/config.toml
+
+# Debounce profiles
+# Used for scroll wheel tilt buttons to prevent accidental activation
+[debounce.scroll]
+initial_hold_ms = 150      # Must hold for 150ms before first activation
+repeat_window_ms = 2000    # After activation, rapid repeats work for 2 seconds
+
+# Key bindings
+# Keys are lowercase: f13, f14, etc.
+# Actions: media_play_pause, media_next, media_prev, media_stop,
+#          browser_back, browser_forward, passthrough, block
+
+# Play/Pause - simple action, no conditions
+[bindings.f13]
+action = "media_play_pause"
+
+# Open for games/scripts - passes F14 through unchanged
+[bindings.f14]
+action = "passthrough"
+
+# Previous track - uses scroll debounce to prevent accidental bumps
+[bindings.f15]
+action = "media_prev"
+debounce = "scroll"
+
+# Next track - uses scroll debounce
+[bindings.f16]
+action = "media_next"
+debounce = "scroll"
+
+# Back - context-sensitive: browser back in Vivaldi/Firefox, passthrough elsewhere
+[bindings.f17]
+action = [
+    { condition = { window = { title = "*Vivaldi*" } }, action = "browser_back" },
+    { condition = { window = { title = "*Firefox*" } }, action = "browser_back" },
+    { condition = { window = { binary = "vivaldi*" } }, action = "browser_back" },
+    { condition = { window = { binary = "firefox*" } }, action = "browser_back" },
+    # No condition = implicit passthrough
+]
+
+# Forward - context-sensitive
+[bindings.f18]
+action = [
+    { condition = { window = { title = "*Vivaldi*" } }, action = "browser_forward" },
+    { condition = { window = { title = "*Firefox*" } }, action = "browser_forward" },
+    { condition = { window = { binary = "vivaldi*" } }, action = "browser_forward" },
+    { condition = { window = { binary = "firefox*" } }, action = "browser_forward" },
+]
+
+# Open for games/scripts
+[bindings.f19]
+action = "passthrough"
+
+# Examples of other condition patterns:
+
+# Block a key when a specific game is running
+# [bindings.f20]
+# action = [
+#     { condition = { window = { binary = "game.exe" } }, action = "block" },
+# ]
+
+# Use negation to enable only when NOT in a game
+# [bindings.f21]
+# action = [
+#     { condition = { window = { not_binary = "*game*" } }, action = "media_play_pause" },
+# ]
+
+# Combine positive and negative conditions (AND logic)
+# [bindings.f22]
+# action = [
+#     { condition = { window = { title = "*YouTube*", not_binary = "discord*" } }, action = "media_play_pause" },
+# ]
