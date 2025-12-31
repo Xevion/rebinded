@@ -2,6 +2,10 @@
 name = "rebinded"
 version = "0.1.0"
 edition = "2024"
+authors = ["Ryan Walters <ryan@walters.to>"]
+license = "LGPL-3.0"
+description = "Cross-platform key remapping daemon with per-application context and stateful debouncing"
+repository = "https://github.com/xevion/rebinded"
 
 [[bin]]
 name = "rebinded"
