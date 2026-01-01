@@ -9,7 +9,8 @@ mod gated_hold;
 pub use gated_hold::{GatedHoldConfig, GatedHoldStrategy};
 
 use crate::config::{Action, WindowInfo};
-use crate::key::KeyEvent;
+use crate::key::{InputEvent, InputEventId};
+use std::collections::HashSet;
 use crate::platform::{EventResponse, MediaCommand, Platform, PlatformInterface, SyntheticKey};
 use async_trait::async_trait;
 use std::time::Duration;
@@ -24,12 +25,23 @@ use std::time::Duration;
 /// For delayed actions, return `Block` and spawn async work via the context.
 #[async_trait]
 pub trait KeyStrategy: Send + Sync {
-    /// Process a key event.
+    /// Additional events this strategy wants to receive (beyond its bound keys).
+    ///
+    /// Strategies can subscribe to events like scroll wheel ticks that aren't
+    /// directly bound to the strategy. The event handler will route these
+    /// subscribed events to the strategy's `process` method.
+    ///
+    /// Default implementation returns an empty set (no extra subscriptions).
+    fn subscriptions(&self) -> HashSet<InputEventId> {
+        HashSet::new()
+    }
+
+    /// Process an input event.
     ///
     /// Must return quickly (< 100ms recommended). For delayed actions,
     /// return `EventResponse::Block` and use `ctx.execute_after()` to
     /// schedule the action.
-    async fn process(&mut self, event: &KeyEvent, ctx: &StrategyContext) -> EventResponse;
+    async fn process(&mut self, event: &InputEvent, ctx: &StrategyContext) -> EventResponse;
 }
 
 /// Wrapper to make Platform sendable across threads for delayed execution.

@@ -7,15 +7,25 @@
 # gated_hold: Requires key to be held before first activation, then allows
 #             rapid re-presses. Good for scroll wheel tilt buttons to prevent
 #             accidental activation while allowing intentional rapid skipping.
+#
+#             Optional "diverts" field: While a key is held (either waiting for
+#             gate or already activated), receiving a divert event (e.g., scroll)
+#             transitions to "diverted" mode and executes the mapped action.
+#             The original action is cancelled (if pending) or released (if active).
+#             Scrolling while tilted = volume control instead of track skip.
 
 [strategies.scroll]
 type = "gated_hold"
 initial_hold_ms = 110      # Must hold for 110ms before first activation
 repeat_window_ms = 2000    # After release, quick re-presses activate immediately for 2 seconds
+# Diverts: while holding a key bound to this strategy, these events trigger alternative actions
+# instead of the normal gated hold behavior. Useful for volume control while track-skipping.
+diverts = { scroll_up = "volume_up", scroll_down = "volume_down" }
 
 # Key bindings
-# Keys are lowercase: F13, F14, etc.
+# Keys are case-insensitive: F13, f13, etc.
 # Actions: media_play_pause, media_next, media_previous, media_stop,
+#          volume_up, volume_down, volume_mute,
 #          browser_back, browser_forward, passthrough, block
 
 # Play/Pause - simple action, no conditions

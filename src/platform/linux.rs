@@ -8,7 +8,7 @@
 
 use super::{EventResponse, MediaCommand, PlatformInterface, SyntheticKey};
 use crate::config::WindowInfo;
-use crate::key::KeyEvent;
+use crate::key::InputEvent;
 use crate::strategy::PlatformHandle;
 use anyhow::Result;
 use std::collections::HashMap;
@@ -69,10 +69,12 @@ impl PlatformInterface for Platform {
 
     async fn run<F, Fut>(&mut self, mut _handler: F) -> Result<()>
     where
-        F: FnMut(KeyEvent, PlatformHandle) -> Fut,
+        F: FnMut(InputEvent, PlatformHandle) -> Fut,
         Fut: Future<Output = EventResponse>,
     {
         info!("starting Linux input handler");
+
+        // TODO: Implement scroll event capture via evdev REL_WHEEL
 
         // TODO: Implement Linux input handling
         // Options:

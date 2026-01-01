@@ -26,7 +26,7 @@ pub use windows::{Platform, build_key_name_map, get_key_name};
 use std::future::Future;
 
 use crate::config::WindowInfo;
-use crate::key::KeyEvent;
+use crate::key::InputEvent;
 
 /// Response from the event handler, telling the platform what to do with the key
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +44,9 @@ pub enum MediaCommand {
     Next,
     Previous,
     Stop,
+    VolumeUp,
+    VolumeDown,
+    VolumeMute,
 }
 
 /// Synthetic keys that can be injected (platform-agnostic)
@@ -69,7 +72,7 @@ pub trait PlatformInterface {
     /// Run the platform event loop with an async handler
     async fn run<F, Fut>(&mut self, handler: F) -> anyhow::Result<()>
     where
-        F: FnMut(KeyEvent, crate::strategy::PlatformHandle) -> Fut,
+        F: FnMut(InputEvent, crate::strategy::PlatformHandle) -> Fut,
         Fut: Future<Output = EventResponse>;
 
     /// Query information about the currently focused window

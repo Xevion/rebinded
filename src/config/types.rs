@@ -71,6 +71,8 @@ impl<T: PartialEq> PartialEq for Spanned<T> {
 
 impl<T: Eq> Eq for Spanned<T> {}
 
+use std::collections::HashMap;
+
 /// Strategy configuration variants
 ///
 /// Each variant corresponds to a strategy implementation. The `type` field
@@ -84,6 +86,11 @@ pub enum StrategyConfig {
         initial_hold_ms: u64,
         /// Window during which repeated presses activate immediately (ms)
         repeat_window_ms: u64,
+        /// Events that divert the strategy to alternative actions.
+        /// Keys are event identifiers (e.g., "scroll_up", "scroll_down"),
+        /// values are action names (e.g., "volume_up", "volume_down").
+        #[serde(default)]
+        diverts: HashMap<String, String>,
     },
 }
 
@@ -216,6 +223,11 @@ pub enum Action {
     MediaPrevious,
     MediaStop,
 
+    // Volume actions
+    VolumeUp,
+    VolumeDown,
+    VolumeMute,
+
     // Browser actions
     BrowserBack,
     BrowserForward,
@@ -243,6 +255,9 @@ impl Action {
             Action::MediaNext => platform.send_media(MediaCommand::Next),
             Action::MediaPrevious => platform.send_media(MediaCommand::Previous),
             Action::MediaStop => platform.send_media(MediaCommand::Stop),
+            Action::VolumeUp => platform.send_media(MediaCommand::VolumeUp),
+            Action::VolumeDown => platform.send_media(MediaCommand::VolumeDown),
+            Action::VolumeMute => platform.send_media(MediaCommand::VolumeMute),
             Action::BrowserBack => platform.send_key(SyntheticKey::BrowserBack),
             Action::BrowserForward => platform.send_key(SyntheticKey::BrowserForward),
             Action::Passthrough | Action::Block => {}

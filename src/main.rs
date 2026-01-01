@@ -4,13 +4,13 @@ mod platform;
 mod strategy;
 
 use clap::Parser;
-use config::RuntimeConfig;
-use key::KeyEvent;
+use config::{Action, RuntimeConfig};
+use key::InputEvent;
 use platform::{EventResponse, Platform, PlatformInterface};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use strategy::{PlatformHandle, StrategyContext};
-use tracing::{Level, debug, info};
+use tracing::{Level, debug, info, trace};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -48,7 +48,7 @@ async fn main() -> ExitCode {
     let config_path = args.config.unwrap_or_else(default_config_path);
     info!("loading config from {}", config_path.display());
 
-    let (config, runtime_config) = match config::load(&config_path) {
+    let (config, runtime_config) = match config::load(&config_path).await {
         Ok(result) => result,
         Err(err) => {
             // Use miette's fancy error display
@@ -73,7 +73,7 @@ async fn main() -> ExitCode {
     let mut platform = Platform::new();
 
     if let Err(err) = platform
-        .run(|event: KeyEvent, platform_handle: PlatformHandle| {
+        .run(|event: InputEvent, platform_handle: PlatformHandle| {
             handle_event(event, platform_handle, &runtime_config)
         })
         .await
@@ -85,24 +85,57 @@ async fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Handle a key event from the platform
+/// Handle an input event from the platform
 async fn handle_event(
-    event: KeyEvent,
+    event: InputEvent,
     platform: PlatformHandle,
     config: &RuntimeConfig,
 ) -> EventResponse {
+    let event_id = event.id();
+
+    // Check if any strategy is subscribed to this event
+    if let Some(strategy_names) = config.subscriptions.get(&event_id) {
+        trace!(?event_id, ?strategy_names, "routing to subscribed strategies");
+
+        // Route to each subscribed strategy
+        // If any strategy blocks, return Block; otherwise Passthrough
+        for strategy_name in strategy_names {
+            if let Some(strategy) = config.strategies.get(strategy_name) {
+                // For subscribed events, we use a dummy action since the strategy
+                // will use its own divert actions
+                let ctx = StrategyContext::new(platform, &Action::Block);
+                let mut strategy_guard = strategy.lock().await;
+                let response = strategy_guard.process(&event, &ctx).await;
+
+                if response == EventResponse::Block {
+                    return EventResponse::Block;
+                }
+            }
+        }
+
+        // No strategy blocked, check if this is a key event that also has bindings
+        // (fall through to normal handling below)
+    }
+
+    // For scroll events with no subscriptions, pass through
+    let key_event = match &event {
+        InputEvent::Key(key_event) => key_event,
+        InputEvent::Scroll { .. } => {
+            return EventResponse::Passthrough;
+        }
+    };
+
     // TODO: Fast-path optimization - check static BOUND_KEYS set before crossing
     // async boundary to avoid channel overhead for unbound keys (~99% of key presses)
 
     // Check if this key has a binding - if not, pass through
-    let Some(binding) = config.bindings.get(&event.key) else {
+    let Some(binding) = config.bindings.get(&key_event.key) else {
         return EventResponse::Passthrough;
     };
-    let event = &event; // Reborrow for the rest of the function
 
     // Resolve the action based on window context
     let window = platform.get_active_window();
-    let Some(action) = config.resolve_action(event.key, &window) else {
+    let Some(action) = config.resolve_action(key_event.key, &window) else {
         return EventResponse::Passthrough;
     };
 
@@ -120,20 +153,20 @@ async fn handle_event(
         if let Some(strategy) = config.strategies.get(strategy_name) {
             let ctx = StrategyContext::new(platform, action);
             let mut strategy_guard = strategy.lock().await;
-            return strategy_guard.process(event, &ctx).await;
+            return strategy_guard.process(&event, &ctx).await;
         } else {
             // This should not happen if validation is working correctly
             debug!(
                 strategy = strategy_name,
-                key = ?event.key,
+                key = ?key_event.key,
                 "strategy not found, falling through to direct execution"
             );
         }
     }
 
     // No strategy: execute action directly on key-down
-    if event.down {
-        debug!(key = ?event.key, ?action, "executing action directly");
+    if key_event.down {
+        debug!(key = ?key_event.key, ?action, "executing action directly");
         platform.execute(action);
     }
     EventResponse::Block

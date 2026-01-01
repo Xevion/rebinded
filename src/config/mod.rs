@@ -14,7 +14,7 @@ pub use types::{
     Action, ActionSpec, Binding, ConditionalAction, Spanned, StrategyConfig, WindowInfo,
 };
 
-use crate::key::KeyCode;
+use crate::key::{InputEventId, KeyCode};
 use crate::strategy::{GatedHoldConfig, GatedHoldStrategy, KeyStrategy};
 use serde::Deserialize;
 use serde::de::IntoDeserializer;
@@ -48,6 +48,8 @@ pub struct RuntimeConfig {
     pub bindings: HashMap<KeyCode, Binding>,
     /// Instantiated strategies, keyed by name
     pub strategies: HashMap<String, Arc<Mutex<dyn KeyStrategy>>>,
+    /// Maps subscribed event IDs to the strategies that want to receive them
+    pub subscriptions: HashMap<InputEventId, Vec<String>>,
 }
 
 impl std::fmt::Debug for RuntimeConfig {
@@ -57,6 +59,10 @@ impl std::fmt::Debug for RuntimeConfig {
             .field(
                 "strategies",
                 &format!("<{} strategies>", self.strategies.len()),
+            )
+            .field(
+                "subscriptions",
+                &format!("<{} subscribed events>", self.subscriptions.len()),
             )
             .finish()
     }
@@ -86,24 +92,24 @@ impl RuntimeConfig {
 ///
 /// Returns the parsed config and runtime config, or a detailed error with
 /// source locations for all validation issues found.
-pub fn load(path: impl AsRef<Path>) -> Result<(Config, RuntimeConfig), ConfigError> {
+pub async fn load(path: impl AsRef<Path>) -> Result<(Config, RuntimeConfig), ConfigError> {
     let path = path.as_ref();
     let source_name = path.display().to_string();
 
     let content = std::fs::read_to_string(path).map_err(|e| ConfigError::io(&source_name, e))?;
 
-    load_from_str(&source_name, content)
+    load_from_str(&source_name, content).await
 }
 
 /// Load and validate configuration from a string
 ///
 /// Useful for testing and when config content is already in memory.
-pub fn load_from_str(
+pub async fn load_from_str(
     source_name: &str,
     content: String,
 ) -> Result<(Config, RuntimeConfig), ConfigError> {
     let mut loader = ConfigLoader::new(source_name.to_string(), content);
-    loader.parse_and_build()
+    loader.parse_and_build().await
 }
 
 /// Internal config loader that tracks parsing state and validation issues
@@ -123,7 +129,7 @@ impl ConfigLoader {
     }
 
     /// Parse content and build runtime config
-    fn parse_and_build(&mut self) -> Result<(Config, RuntimeConfig), ConfigError> {
+    async fn parse_and_build(&mut self) -> Result<(Config, RuntimeConfig), ConfigError> {
         // Parse into spanned table for location tracking
         // Clone content for parsing - DeTable<'a> has a lifetime tied to the source,
         // but we need to mutably borrow self during parse_table
@@ -132,7 +138,7 @@ impl ConfigLoader {
             .map_err(|e| ConfigError::parse(&self.source_name, self.source_content.clone(), e))?;
 
         let config = self.parse_table(table.into_inner());
-        let runtime = self.build_runtime(&config);
+        let runtime = self.build_runtime(&config).await;
 
         if self.issues.is_empty() {
             Ok((config, runtime))
@@ -303,7 +309,8 @@ impl ConfigLoader {
                             label: "unknown action".to_string(),
                             help: Some(
                                 "valid actions: media_play_pause, media_next, media_previous, \
-                                 media_stop, browser_back, browser_forward, passthrough, block"
+                                 media_stop, volume_up, volume_down, volume_mute, \
+                                 browser_back, browser_forward, passthrough, block"
                                     .to_string(),
                             ),
                         });
@@ -351,7 +358,7 @@ impl ConfigLoader {
     }
 
     /// Build runtime config with validation
-    fn build_runtime(&mut self, config: &Config) -> RuntimeConfig {
+    async fn build_runtime(&mut self, config: &Config) -> RuntimeConfig {
         // Collect strategy names for reference validation
         let strategy_names: Vec<&str> = config
             .strategies
@@ -420,17 +427,69 @@ impl ConfigLoader {
                 StrategyConfig::GatedHold {
                     initial_hold_ms,
                     repeat_window_ms,
-                } => Arc::new(Mutex::new(GatedHoldStrategy::new(GatedHoldConfig {
-                    initial_hold_ms: *initial_hold_ms,
-                    repeat_window_ms: *repeat_window_ms,
-                }))),
+                    diverts,
+                } => {
+                    // Parse diverts: convert string keys/values to InputEventId/Action
+                    let mut parsed_diverts = HashMap::new();
+                    for (event_str, action_str) in diverts {
+                        // Parse event identifier
+                        let Some(event_id) = InputEventId::from_config_str(event_str) else {
+                            self.issues.push(ConfigIssue {
+                                span: name.span().clone(),
+                                message: format!("invalid divert event: '{event_str}'"),
+                                label: "unknown event".to_string(),
+                                help: Some(
+                                    "valid events: scroll_up, scroll_down, or key names".to_string(),
+                                ),
+                            });
+                            continue;
+                        };
+
+                        // Parse action
+                        let action = match parse_action(action_str) {
+                            Ok(action) => action,
+                            Err(e) => {
+                                self.issues.push(ConfigIssue {
+                                    span: name.span().clone(),
+                                    message: format!("invalid divert action: {e}"),
+                                    label: "unknown action".to_string(),
+                                    help: Some(
+                                        "valid actions: volume_up, volume_down, etc.".to_string(),
+                                    ),
+                                });
+                                continue;
+                            }
+                        };
+
+                        parsed_diverts.insert(event_id, action);
+                    }
+
+                    Arc::new(Mutex::new(GatedHoldStrategy::new(GatedHoldConfig {
+                        initial_hold_ms: *initial_hold_ms,
+                        repeat_window_ms: *repeat_window_ms,
+                        diverts: parsed_diverts,
+                    })))
+                }
             };
             strategies.insert(name.value().clone(), strategy);
+        }
+
+        // Build subscription routing map
+        let mut subscriptions: HashMap<InputEventId, Vec<String>> = HashMap::new();
+        for (name, strategy) in &strategies {
+            let guard = strategy.lock().await;
+            for event_id in guard.subscriptions() {
+                subscriptions
+                    .entry(event_id)
+                    .or_default()
+                    .push(name.clone());
+            }
         }
 
         RuntimeConfig {
             bindings,
             strategies,
+            subscriptions,
         }
     }
 }
@@ -442,6 +501,9 @@ fn parse_action(s: &str) -> Result<Action, String> {
         "media_next" => Ok(Action::MediaNext),
         "media_previous" => Ok(Action::MediaPrevious),
         "media_stop" => Ok(Action::MediaStop),
+        "volume_up" => Ok(Action::VolumeUp),
+        "volume_down" => Ok(Action::VolumeDown),
+        "volume_mute" => Ok(Action::VolumeMute),
         "browser_back" => Ok(Action::BrowserBack),
         "browser_forward" => Ok(Action::BrowserForward),
         "passthrough" => Ok(Action::Passthrough),
@@ -456,32 +518,32 @@ mod tests {
     use crate::config::types::WindowCondition;
     use assert2::assert;
 
-    #[test]
-    fn test_simple_action_parsing() {
+    #[tokio::test]
+    async fn test_simple_action_parsing() {
         let toml = r#"
             [bindings.0x7C]
             action = "media_play_pause"
         "#;
-        let result = load_from_str("test.toml", toml.to_string());
+        let result = load_from_str("test.toml", toml.to_string()).await;
         assert!(result.is_ok());
         let (config, _) = result.unwrap();
         assert!(config.bindings.len() == 1);
     }
 
-    #[test]
-    fn test_conditional_action_parsing() {
+    #[tokio::test]
+    async fn test_conditional_action_parsing() {
         let toml = r#"
             [bindings.0x80]
             action = [
                 { condition = { window = { title = "*vivaldi*" } }, action = "browser_back" },
             ]
         "#;
-        let result = load_from_str("test.toml", toml.to_string());
+        let result = load_from_str("test.toml", toml.to_string()).await;
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_strategy_config() {
+    #[tokio::test]
+    async fn test_strategy_config() {
         let toml = r#"
             [strategies.scroll]
             type = "gated_hold"
@@ -492,39 +554,39 @@ mod tests {
             action = "media_previous"
             strategy = "scroll"
         "#;
-        let result = load_from_str("test.toml", toml.to_string());
+        let result = load_from_str("test.toml", toml.to_string()).await;
         assert!(result.is_ok());
         let (config, runtime) = result.unwrap();
         assert!(config.strategies.len() == 1);
         assert!(runtime.strategies.contains_key("scroll"));
     }
 
-    #[test]
-    fn test_invalid_action_name() {
+    #[tokio::test]
+    async fn test_invalid_action_name() {
         let toml = r#"
             [bindings.0x7C]
             action = "invalid_action"
         "#;
-        let result = load_from_str("test.toml", toml.to_string());
+        let result = load_from_str("test.toml", toml.to_string()).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_undefined_strategy_error() {
+    #[tokio::test]
+    async fn test_undefined_strategy_error() {
         let toml = r#"
             [bindings.0x7C]
             action = "media_play_pause"
             strategy = "nonexistent"
         "#;
-        let result = load_from_str("test.toml", toml.to_string());
+        let result = load_from_str("test.toml", toml.to_string()).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         let msg = format!("{err:?}");
         assert!(msg.contains("nonexistent"));
     }
 
-    #[test]
-    fn test_duplicate_binding_error() {
+    #[tokio::test]
+    async fn test_duplicate_binding_error() {
         // Both hex codes resolve to the same key
         let toml = r#"
             [bindings.0x7C]
@@ -533,15 +595,15 @@ mod tests {
             [bindings.124]
             action = "block"
         "#;
-        let result = load_from_str("test.toml", toml.to_string());
+        let result = load_from_str("test.toml", toml.to_string()).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         let msg = format!("{err:?}");
         assert!(msg.contains("duplicate"));
     }
 
-    #[test]
-    fn test_multiple_errors_collected() {
+    #[tokio::test]
+    async fn test_multiple_errors_collected() {
         let toml = r#"
             [bindings.invalid_key_1]
             action = "media_play_pause"
@@ -550,7 +612,7 @@ mod tests {
             action = "media_next"
             strategy = "undefined_strategy"
         "#;
-        let result = load_from_str("test.toml", toml.to_string());
+        let result = load_from_str("test.toml", toml.to_string()).await;
         assert!(result.is_err());
 
         // Should have multiple errors
@@ -601,5 +663,65 @@ mod tests {
 
         assert!(condition.matches(&browser));
         assert!(!condition.matches(&game));
+    }
+
+    #[tokio::test]
+    async fn test_gated_hold_with_diverts() {
+        let toml = r#"
+            [strategies.scroll]
+            type = "gated_hold"
+            initial_hold_ms = 110
+            repeat_window_ms = 2000
+            diverts = { scroll_up = "volume_up", scroll_down = "volume_down" }
+
+            [bindings.0x7E]
+            action = "media_previous"
+            strategy = "scroll"
+        "#;
+        let result = load_from_str("test.toml", toml.to_string()).await;
+        assert!(result.is_ok());
+        let (config, runtime) = result.unwrap();
+        assert!(config.strategies.len() == 1);
+        assert!(runtime.strategies.contains_key("scroll"));
+        // Verify subscriptions were built
+        assert!(runtime.subscriptions.len() == 2); // scroll_up and scroll_down
+    }
+
+    #[tokio::test]
+    async fn test_gated_hold_invalid_divert_event() {
+        let toml = r#"
+            [strategies.scroll]
+            type = "gated_hold"
+            initial_hold_ms = 110
+            repeat_window_ms = 2000
+            diverts = { invalid_event = "volume_up" }
+
+            [bindings.0x7E]
+            action = "media_previous"
+            strategy = "scroll"
+        "#;
+        let result = load_from_str("test.toml", toml.to_string()).await;
+        assert!(result.is_err());
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(msg.contains("invalid divert event"));
+    }
+
+    #[tokio::test]
+    async fn test_gated_hold_invalid_divert_action() {
+        let toml = r#"
+            [strategies.scroll]
+            type = "gated_hold"
+            initial_hold_ms = 110
+            repeat_window_ms = 2000
+            diverts = { scroll_up = "invalid_action" }
+
+            [bindings.0x7E]
+            action = "media_previous"
+            strategy = "scroll"
+        "#;
+        let result = load_from_str("test.toml", toml.to_string()).await;
+        assert!(result.is_err());
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(msg.contains("invalid divert action"));
     }
 }

@@ -10,7 +10,7 @@
 
 use super::{EventResponse, MediaCommand, PlatformInterface, SyntheticKey};
 use crate::config::WindowInfo;
-use crate::key::{KeyCode, KeyEvent};
+use crate::key::{InputEvent, KeyCode, KeyEvent};
 use crate::strategy::PlatformHandle;
 use anyhow::{Result, anyhow};
 use std::collections::HashMap;
@@ -31,9 +31,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetClassNameW, GetForegroundWindow, GetMessageW,
-    GetWindowTextW, GetWindowThreadProcessId, KBDLLHOOKSTRUCT, MSG, PostThreadMessageW,
-    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP,
-    WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    GetWindowTextW, GetWindowThreadProcessId, KBDLLHOOKSTRUCT, MSLLHOOKSTRUCT, MSG,
+    PostThreadMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL,
+    WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_MOUSEWHEEL, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 use windows::core::PWSTR;
 
@@ -154,7 +154,7 @@ pub fn build_key_name_map() -> HashMap<String, u32> {
 
 /// Channel message from hook thread to main thread
 struct HookEvent {
-    event: KeyEvent,
+    event: InputEvent,
     response_tx: tokio::sync::oneshot::Sender<EventResponse>,
 }
 
@@ -192,15 +192,15 @@ impl PlatformInterface for Platform {
 
     /// Run the platform event loop with an async handler
     ///
-    /// Captures keyboard events and calls `handler` for each.
+    /// Captures keyboard and mouse wheel events and calls `handler` for each.
     /// The handler receives the event and a PlatformHandle for
     /// querying window info and executing actions.
     async fn run<F, Fut>(&mut self, mut handler: F) -> Result<()>
     where
-        F: FnMut(KeyEvent, PlatformHandle) -> Fut,
+        F: FnMut(InputEvent, PlatformHandle) -> Fut,
         Fut: Future<Output = EventResponse>,
     {
-        info!("initializing Windows keyboard hook");
+        info!("initializing Windows input hooks");
 
         // Spawn the hook thread (Win32 message pump must run on dedicated thread)
         let hook_handle = tokio::task::spawn_blocking(run_hook_thread);
@@ -246,6 +246,9 @@ impl PlatformInterface for Platform {
             MediaCommand::Next => 0xB0,      // VK_MEDIA_NEXT_TRACK
             MediaCommand::Previous => 0xB1,  // VK_MEDIA_PREV_TRACK
             MediaCommand::Stop => 0xB2,      // VK_MEDIA_STOP
+            MediaCommand::VolumeUp => 0xAF,  // VK_VOLUME_UP
+            MediaCommand::VolumeDown => 0xAE, // VK_VOLUME_DOWN
+            MediaCommand::VolumeMute => 0xAD, // VK_VOLUME_MUTE
         };
         send_key_press(vk);
     }
@@ -263,10 +266,14 @@ fn run_hook_thread() -> Result<()> {
         let _ = HOOK_THREAD_ID.set(thread_id);
 
         // Install low-level keyboard hook
-        let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), None, 0)
+        let keyboard_hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), None, 0)
             .map_err(|e| anyhow!("failed to install keyboard hook: {}", e))?;
+        info!("keyboard hook installed");
 
-        info!("keyboard hook installed, starting message pump");
+        // Install low-level mouse hook
+        let mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), None, 0)
+            .map_err(|e| anyhow!("failed to install mouse hook: {}", e))?;
+        info!("mouse hook installed, starting message pump");
 
         // Message pump - required for low-level hooks to work
         // Exits when WM_QUIT is received (GetMessageW returns false)
@@ -277,8 +284,9 @@ fn run_hook_thread() -> Result<()> {
         }
 
         // Cleanup (won't reach here normally)
-        let _ = UnhookWindowsHookEx(hook);
-        info!("keyboard hook uninstalled");
+        let _ = UnhookWindowsHookEx(keyboard_hook);
+        let _ = UnhookWindowsHookEx(mouse_hook);
+        info!("input hooks uninstalled");
     }
 
     Ok(())
@@ -315,7 +323,9 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
     trace!(?key_code, is_keydown, "hook received key event");
 
     // Try to send event to main thread and wait for response
-    let should_block = process_hook_event(key_code, is_keydown);
+    let key_event = KeyEvent::new(key_code, is_keydown);
+    let input_event = InputEvent::Key(key_event);
+    let should_block = process_hook_event(input_event);
 
     if should_block {
         // Return non-zero to block the key from propagating
@@ -327,12 +337,11 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
 }
 
 /// Send event to main thread and wait for response
-fn process_hook_event(key_code: KeyCode, is_keydown: bool) -> bool {
+fn process_hook_event(event: InputEvent) -> bool {
     let Some(tx) = HOOK_CHANNEL.get() else {
         return false;
     };
 
-    let event = KeyEvent::new(key_code, is_keydown);
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();
 
     // Send event to main thread
@@ -349,6 +358,41 @@ fn process_hook_event(key_code: KeyCode, is_keydown: bool) -> bool {
             debug!("response channel closed");
             false
         }
+    }
+}
+
+/// Low-level mouse hook callback
+/// SAFETY: Called by Windows from the message pump thread
+unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // code < 0 means we must pass to next hook without processing
+    if code < 0 {
+        return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+    }
+
+    // Only process mouse wheel events
+    if wparam.0 as u32 != WM_MOUSEWHEEL {
+        return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+    }
+
+    // SAFETY: lparam points to a valid MSLLHOOKSTRUCT when code >= 0
+    let mouse_struct = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
+
+    // Extract wheel delta from mouseData (high word)
+    // Positive = scroll up (away from user), negative = scroll down (toward user)
+    let wheel_delta = (mouse_struct.mouseData >> 16) as i16;
+    let scroll_up = wheel_delta > 0;
+
+    trace!(wheel_delta, scroll_up, "hook received scroll event");
+
+    // Try to send event to main thread and wait for response
+    let input_event = InputEvent::Scroll { up: scroll_up };
+    let should_block = process_hook_event(input_event);
+
+    if should_block {
+        // Return non-zero to block the scroll from propagating
+        LRESULT(1)
+    } else {
+        unsafe { CallNextHookEx(None, code, wparam, lparam) }
     }
 }
 
