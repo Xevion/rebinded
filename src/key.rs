@@ -263,7 +263,10 @@ mod tests {
     #[test]
     fn test_input_event_id_display() {
         assert_eq!(InputEventId::Scroll { up: true }.to_string(), "scroll_up");
-        assert_eq!(InputEventId::Scroll { up: false }.to_string(), "scroll_down");
+        assert_eq!(
+            InputEventId::Scroll { up: false }.to_string(),
+            "scroll_down"
+        );
     }
 
     #[test]

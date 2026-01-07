@@ -31,7 +31,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetClassNameW, GetForegroundWindow, GetMessageW,
-    GetWindowTextW, GetWindowThreadProcessId, KBDLLHOOKSTRUCT, MSLLHOOKSTRUCT, MSG,
+    GetWindowTextW, GetWindowThreadProcessId, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT,
     PostThreadMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL,
     WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_MOUSEWHEEL, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
@@ -242,11 +242,11 @@ impl PlatformInterface for Platform {
 
     fn send_media(&self, cmd: MediaCommand) {
         let vk = match cmd {
-            MediaCommand::PlayPause => 0xB3, // VK_MEDIA_PLAY_PAUSE
-            MediaCommand::Next => 0xB0,      // VK_MEDIA_NEXT_TRACK
-            MediaCommand::Previous => 0xB1,  // VK_MEDIA_PREV_TRACK
-            MediaCommand::Stop => 0xB2,      // VK_MEDIA_STOP
-            MediaCommand::VolumeUp => 0xAF,  // VK_VOLUME_UP
+            MediaCommand::PlayPause => 0xB3,  // VK_MEDIA_PLAY_PAUSE
+            MediaCommand::Next => 0xB0,       // VK_MEDIA_NEXT_TRACK
+            MediaCommand::Previous => 0xB1,   // VK_MEDIA_PREV_TRACK
+            MediaCommand::Stop => 0xB2,       // VK_MEDIA_STOP
+            MediaCommand::VolumeUp => 0xAF,   // VK_VOLUME_UP
             MediaCommand::VolumeDown => 0xAE, // VK_VOLUME_DOWN
             MediaCommand::VolumeMute => 0xAD, // VK_VOLUME_MUTE
         };

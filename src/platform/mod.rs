@@ -84,3 +84,10 @@ pub trait PlatformInterface {
     /// Execute a media control command
     fn send_media(&self, cmd: MediaCommand);
 }
+
+// Mock platform for testing
+#[cfg(test)]
+pub(crate) mod mock;
+
+#[cfg(test)]
+pub(crate) use mock::MockPlatform;

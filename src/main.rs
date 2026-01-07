@@ -95,7 +95,11 @@ async fn handle_event(
 
     // Check if any strategy is subscribed to this event
     if let Some(strategy_names) = config.subscriptions.get(&event_id) {
-        trace!(?event_id, ?strategy_names, "routing to subscribed strategies");
+        trace!(
+            ?event_id,
+            ?strategy_names,
+            "routing to subscribed strategies"
+        );
 
         // Route to each subscribed strategy
         // If any strategy blocks, return Block; otherwise Passthrough

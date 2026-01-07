@@ -18,7 +18,7 @@ use crate::strategy::{KeyStrategy, PlatformHandle, StrategyContext};
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tracing::debug;
 
 /// Configuration for gated hold behavior
@@ -64,24 +64,35 @@ pub struct GatedHoldStrategy {
     /// Cached platform handle for executing divert actions
     /// Set on first key event, used for scroll events
     platform_handle: Option<PlatformHandle>,
+    /// Channel to receive timer completion notifications
+    /// When a hold timer fires, it sends the key name here so the strategy
+    /// can transition the key from Holding to Active state
+    timer_tx: mpsc::UnboundedSender<String>,
+    timer_rx: mpsc::UnboundedReceiver<String>,
 }
 
 impl GatedHoldStrategy {
     /// Create a new gated hold strategy with the given configuration
     pub fn new(config: GatedHoldConfig) -> Self {
+        let (timer_tx, timer_rx) = mpsc::unbounded_channel();
         Self {
             config,
             key_states: HashMap::new(),
             last_release: None,
             platform_handle: None,
+            timer_tx,
+            timer_rx,
         }
     }
 
     /// Check if any key is currently in a "held" state (Holding, Active, or Diverted)
     fn any_key_held(&self) -> bool {
-        self.key_states
-            .values()
-            .any(|s| matches!(s, KeyState::Holding { .. } | KeyState::Active | KeyState::Diverted))
+        self.key_states.values().any(|s| {
+            matches!(
+                s,
+                KeyState::Holding { .. } | KeyState::Active | KeyState::Diverted
+            )
+        })
     }
 
     /// Transition all held keys to Diverted state, cancelling timers and recording
@@ -165,6 +176,22 @@ impl GatedHoldStrategy {
         false
     }
 
+    /// Process pending timer completion notifications
+    ///
+    /// When hold timers fire, they send the key name through the timer channel.
+    /// This method drains the channel and transitions keys from Holding to Active.
+    /// Should be called at the start of `process()` to ensure state is up-to-date.
+    fn process_timer_completions(&mut self) {
+        while let Ok(key_name) = self.timer_rx.try_recv() {
+            // Check if key is still in Holding state
+            // (it might have been released already, in which case we ignore the message)
+            if let Some(KeyState::Holding { .. }) = self.key_states.get(&key_name) {
+                debug!(key = %key_name, "gated_hold: holding -> active (timer completion)");
+                self.key_states.insert(key_name, KeyState::Active);
+            }
+        }
+    }
+
     /// Handle key-down event
     fn key_down(&mut self, key_name: &str, ctx: &StrategyContext) -> EventResponse {
         let gate_open = self.is_gate_open();
@@ -190,6 +217,8 @@ impl GatedHoldStrategy {
                     // Clone what we need for the spawned task
                     let action = ctx.action().clone();
                     let platform_handle = ctx.platform_handle();
+                    let timer_tx = self.timer_tx.clone();
+                    let key_name_owned = key_name.to_string();
 
                     tokio::spawn(async move {
                         tokio::select! {
@@ -197,6 +226,9 @@ impl GatedHoldStrategy {
                                 // Hold threshold reached — execute action
                                 platform_handle.execute(&action);
                                 debug!("gated_hold: hold timer fired, action executed");
+
+                                // Notify strategy that timer completed so it can transition to Active
+                                let _ = timer_tx.send(key_name_owned);
                             }
                             _ = cancel_rx => {
                                 // Cancelled (key released early)
@@ -273,6 +305,9 @@ impl KeyStrategy for GatedHoldStrategy {
     }
 
     async fn process(&mut self, event: &InputEvent, ctx: &StrategyContext) -> EventResponse {
+        // Process any pending timer completions first
+        self.process_timer_completions();
+
         // Cache the platform handle for use in divert actions
         if self.platform_handle.is_none() {
             self.platform_handle = Some(ctx.platform_handle());
@@ -482,7 +517,10 @@ mod tests {
         strategy
             .key_states
             .insert("f15".to_string(), KeyState::Active);
-        assert!(strategy.last_release.is_none(), "precondition: no last_release");
+        assert!(
+            strategy.last_release.is_none(),
+            "precondition: no last_release"
+        );
 
         let event_id = InputEventId::Scroll { up: true };
         let response = strategy.handle_divert(&event_id);
@@ -560,10 +598,7 @@ mod tests {
         let event_id = InputEventId::Scroll { up: true };
         let response = strategy.handle_divert(&event_id);
 
-        assert!(
-            matches!(response, EventResponse::Block),
-            "should block"
-        );
+        assert!(matches!(response, EventResponse::Block), "should block");
         assert!(
             matches!(strategy.key_states.get("f15"), Some(KeyState::Diverted)),
             "f15 should transition to Diverted"
@@ -620,7 +655,10 @@ mod tests {
         let strategy = GatedHoldStrategy::new(test_config()); // No diverts
         let subs = strategy.subscriptions();
 
-        assert!(subs.is_empty(), "should have no subscriptions without diverts");
+        assert!(
+            subs.is_empty(),
+            "should have no subscriptions without diverts"
+        );
     }
 
     #[test]
@@ -644,5 +682,252 @@ mod tests {
             matches!(strategy.key_states.get("f15"), Some(KeyState::Active)),
             "key should remain in Active state"
         );
+    }
+
+    // ========================================================================
+    // Timer Completion Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_timer_completion_transitions_to_active() {
+        use crate::config::Action;
+        use crate::key::{KeyCode, KeyEvent};
+        use crate::platform::MockPlatform;
+        use crate::strategy::{PlatformHandle, StrategyContext};
+        use std::sync::Arc;
+
+        let config = GatedHoldConfig {
+            initial_hold_ms: 50,
+            repeat_window_ms: 200,
+            diverts: HashMap::new(),
+        };
+        let mut strategy = GatedHoldStrategy::new(config);
+
+        // Create mock platform and context
+        let platform = Arc::new(MockPlatform::new());
+        let platform_handle = unsafe { PlatformHandle::from_mock(&platform) };
+        let action = Action::MediaNext;
+        let ctx = StrategyContext::new(platform_handle, &action);
+
+        // Press key
+        let key_event = InputEvent::Key(KeyEvent::new(KeyCode::new(0x1), true));
+        let response = strategy.process(&key_event, &ctx).await;
+        assert!(matches!(response, EventResponse::Block));
+
+        // Key should be in Holding state
+        assert!(matches!(
+            strategy.key_states.get("KEY_ESC"),
+            Some(KeyState::Holding { .. })
+        ));
+
+        // Wait for timer to fire (slightly longer than initial_hold_ms)
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        // Process timer completions by calling process with a dummy event
+        // (In real usage, this happens automatically on the next event)
+        strategy.process_timer_completions();
+
+        // Key should now be in Active state
+        assert!(
+            matches!(strategy.key_states.get("KEY_ESC"), Some(KeyState::Active)),
+            "key should transition to Active after timer fires"
+        );
+
+        // Release key
+        let key_up = InputEvent::Key(KeyEvent::new(KeyCode::new(0x1), false));
+        strategy.process(&key_up, &ctx).await;
+
+        // last_release should be recorded
+        assert!(
+            strategy.last_release.is_some(),
+            "last_release should be recorded when releasing Active key"
+        );
+
+        // Verify that MediaNext was actually executed
+        platform.assert_media_sent(crate::platform::MediaCommand::Next);
+        platform.assert_call_count(1);
+    }
+
+    #[tokio::test]
+    async fn test_repeat_window_after_timer_activation() {
+        use crate::config::Action;
+        use crate::key::{KeyCode, KeyEvent};
+        use crate::platform::MockPlatform;
+        use crate::strategy::{PlatformHandle, StrategyContext};
+        use std::sync::Arc;
+
+        let config = GatedHoldConfig {
+            initial_hold_ms: 50,
+            repeat_window_ms: 500, // Long window for testing
+            diverts: HashMap::new(),
+        };
+        let mut strategy = GatedHoldStrategy::new(config);
+
+        let platform = Arc::new(MockPlatform::new());
+        let platform_handle = unsafe { PlatformHandle::from_mock(&platform) };
+        let action = Action::MediaNext;
+        let ctx = StrategyContext::new(platform_handle, &action);
+
+        // First press: hold until timer fires
+        let key_down = InputEvent::Key(KeyEvent::new(KeyCode::new(0x1), true));
+        strategy.process(&key_down, &ctx).await;
+
+        // Wait for timer
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        strategy.process_timer_completions();
+
+        // Release
+        let key_up = InputEvent::Key(KeyEvent::new(KeyCode::new(0x1), false));
+        strategy.process(&key_up, &ctx).await;
+
+        // Gate should be open
+        assert!(
+            strategy.is_gate_open(),
+            "gate should be open after release within repeat window"
+        );
+
+        // Quick second press (within repeat window)
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let response = strategy.process(&key_down, &ctx).await;
+
+        // Should activate immediately without waiting for hold timer
+        assert!(
+            matches!(strategy.key_states.get("KEY_ESC"), Some(KeyState::Active)),
+            "second press should activate immediately (gate open)"
+        );
+        assert!(matches!(response, EventResponse::Block));
+    }
+
+    #[tokio::test]
+    async fn test_timer_completion_after_early_release() {
+        use crate::config::Action;
+        use crate::key::{KeyCode, KeyEvent};
+        use crate::platform::MockPlatform;
+        use crate::strategy::{PlatformHandle, StrategyContext};
+        use std::sync::Arc;
+
+        let config = GatedHoldConfig {
+            initial_hold_ms: 100,
+            repeat_window_ms: 200,
+            diverts: HashMap::new(),
+        };
+        let mut strategy = GatedHoldStrategy::new(config);
+
+        let platform = Arc::new(MockPlatform::new());
+        let platform_handle = unsafe { PlatformHandle::from_mock(&platform) };
+        let action = Action::MediaNext;
+        let ctx = StrategyContext::new(platform_handle, &action);
+
+        // Press key
+        let key_down = InputEvent::Key(KeyEvent::new(KeyCode::new(0x1), true));
+        strategy.process(&key_down, &ctx).await;
+
+        // Release before timer fires
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let key_up = InputEvent::Key(KeyEvent::new(KeyCode::new(0x1), false));
+        strategy.process(&key_up, &ctx).await;
+
+        // Key should be Idle
+        assert!(
+            !strategy.key_states.contains_key("KEY_ESC"),
+            "key should be Idle after early release"
+        );
+
+        // Wait for timer to fire (it will, but the message should be ignored)
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Process timer completion
+        strategy.process_timer_completions();
+
+        // Key should still be Idle (not transitioned to Active)
+        assert!(
+            !strategy.key_states.contains_key("KEY_ESC"),
+            "key should remain Idle even after timer message arrives"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_multiple_keys_share_gate_after_timer() {
+        use crate::config::Action;
+        use crate::key::{KeyCode, KeyEvent};
+        use crate::platform::MockPlatform;
+        use crate::strategy::{PlatformHandle, StrategyContext};
+        use std::sync::Arc;
+
+        let config = GatedHoldConfig {
+            initial_hold_ms: 50,
+            repeat_window_ms: 500,
+            diverts: HashMap::new(),
+        };
+        let mut strategy = GatedHoldStrategy::new(config);
+
+        let platform = Arc::new(MockPlatform::new());
+        let platform_handle = unsafe { PlatformHandle::from_mock(&platform) };
+        let action = Action::MediaNext;
+        let ctx = StrategyContext::new(platform_handle, &action);
+
+        // Press key1, wait for timer, release
+        let key1_down = InputEvent::Key(KeyEvent::new(KeyCode::new(0x1), true));
+        strategy.process(&key1_down, &ctx).await;
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        strategy.process_timer_completions();
+
+        let key1_up = InputEvent::Key(KeyEvent::new(KeyCode::new(0x1), false));
+        strategy.process(&key1_up, &ctx).await;
+
+        // Gate should be open
+        assert!(strategy.is_gate_open());
+
+        // Press different key2 quickly
+        let key2_down = InputEvent::Key(KeyEvent::new(KeyCode::new(0x2), true));
+        let response = strategy.process(&key2_down, &ctx).await;
+
+        // Key2 should activate immediately (shared gate is open)
+        assert!(
+            matches!(strategy.key_states.get("KEY_1"), Some(KeyState::Active)),
+            "key2 should activate immediately due to shared gate"
+        );
+        assert!(matches!(response, EventResponse::Block));
+
+        // Verify both key presses executed the action (first after timer, second immediately)
+        platform.assert_call_count(2);
+    }
+
+    #[tokio::test]
+    async fn test_mock_platform_records_actions() {
+        use crate::config::Action;
+        use crate::key::{KeyCode, KeyEvent};
+        use crate::platform::{MediaCommand, MockPlatform};
+        use crate::strategy::{PlatformHandle, StrategyContext};
+        use std::sync::Arc;
+
+        let platform = Arc::new(MockPlatform::new());
+        let platform_handle = unsafe { PlatformHandle::from_mock(&platform) };
+
+        // Test that executing actions records them
+        let action = Action::MediaNext;
+        let ctx = StrategyContext::new(platform_handle, &action);
+
+        // Initially no calls
+        platform.assert_no_calls();
+
+        // Execute action
+        ctx.execute();
+
+        // Should have recorded the media command
+        platform.assert_media_sent(MediaCommand::Next);
+        platform.assert_call_count(1);
+
+        // Execute another action
+        let action2 = Action::VolumeUp;
+        action2.execute(&*platform);
+
+        // Should have 2 calls now
+        platform.assert_call_count(2);
+
+        // Clear and verify
+        platform.clear_calls();
+        platform.assert_no_calls();
     }
 }

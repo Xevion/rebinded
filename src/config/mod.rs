@@ -439,7 +439,8 @@ impl ConfigLoader {
                                 message: format!("invalid divert event: '{event_str}'"),
                                 label: "unknown event".to_string(),
                                 help: Some(
-                                    "valid events: scroll_up, scroll_down, or key names".to_string(),
+                                    "valid events: scroll_up, scroll_down, or key names"
+                                        .to_string(),
                                 ),
                             });
                             continue;

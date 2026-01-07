@@ -10,9 +10,9 @@ pub use gated_hold::{GatedHoldConfig, GatedHoldStrategy};
 
 use crate::config::{Action, WindowInfo};
 use crate::key::{InputEvent, InputEventId};
-use std::collections::HashSet;
 use crate::platform::{EventResponse, MediaCommand, Platform, PlatformInterface, SyntheticKey};
 use async_trait::async_trait;
+use std::collections::HashSet;
 use std::time::Duration;
 
 /// Trait for key event processing strategies.
@@ -50,17 +50,16 @@ pub trait KeyStrategy: Send + Sync {
 /// all PlatformHandles in practice because the event loop owns the platform.
 #[derive(Clone, Copy)]
 pub struct PlatformHandle {
-    ptr: SendPtr,
+    ptr: *const (),
+    send_media_fn: unsafe fn(*const (), MediaCommand),
+    send_key_fn: unsafe fn(*const (), SyntheticKey),
+    get_window_fn: unsafe fn(*const ()) -> WindowInfo,
 }
-
-/// Wrapper to make raw pointer Send + Sync
-#[derive(Clone, Copy)]
-struct SendPtr(*const Platform);
 
 // SAFETY: Platform is accessed from a single-threaded tokio runtime,
 // and the pointer is valid for the lifetime of the program.
-unsafe impl Send for SendPtr {}
-unsafe impl Sync for SendPtr {}
+unsafe impl Send for PlatformHandle {}
+unsafe impl Sync for PlatformHandle {}
 
 impl PlatformHandle {
     /// Create a new platform handle from a reference
@@ -69,37 +68,86 @@ impl PlatformHandle {
     /// The caller must ensure the platform outlives all uses of this handle.
     #[allow(dead_code)] // Used by platform-specific code
     pub fn new(platform: &Platform) -> Self {
+        unsafe fn send_media_impl(ptr: *const (), cmd: MediaCommand) {
+            let platform = &*(ptr as *const Platform);
+            platform.send_media(cmd);
+        }
+        unsafe fn send_key_impl(ptr: *const (), key: SyntheticKey) {
+            let platform = &*(ptr as *const Platform);
+            platform.send_key(key);
+        }
+        unsafe fn get_window_impl(ptr: *const ()) -> WindowInfo {
+            let platform = &*(ptr as *const Platform);
+            platform.get_active_window()
+        }
+
         Self {
-            ptr: SendPtr(platform as *const Platform),
+            ptr: platform as *const Platform as *const (),
+            send_media_fn: send_media_impl,
+            send_key_fn: send_key_impl,
+            get_window_fn: get_window_impl,
         }
     }
 
-    /// Get a reference to the platform
-    fn get(&self) -> &Platform {
-        // SAFETY: The platform is valid for the lifetime of the program
-        unsafe { &*self.ptr.0 }
+    /// Create a platform handle from MockPlatform for testing
+    ///
+    /// # Safety
+    /// The caller must ensure the MockPlatform outlives all uses of this handle.
+    #[cfg(test)]
+    pub unsafe fn from_mock(platform: &crate::platform::MockPlatform) -> Self {
+        unsafe fn send_media_impl(ptr: *const (), cmd: MediaCommand) {
+            let platform = &*(ptr as *const crate::platform::MockPlatform);
+            platform.send_media(cmd);
+        }
+        unsafe fn send_key_impl(ptr: *const (), key: SyntheticKey) {
+            let platform = &*(ptr as *const crate::platform::MockPlatform);
+            platform.send_key(key);
+        }
+        unsafe fn get_window_impl(ptr: *const ()) -> WindowInfo {
+            let platform = &*(ptr as *const crate::platform::MockPlatform);
+            platform.get_active_window()
+        }
+
+        Self {
+            ptr: platform as *const crate::platform::MockPlatform as *const (),
+            send_media_fn: send_media_impl,
+            send_key_fn: send_key_impl,
+            get_window_fn: get_window_impl,
+        }
     }
 
     /// Execute an action on the platform
     pub fn execute(&self, action: &Action) {
-        action.execute(self.get());
+        use Action::*;
+        match action {
+            MediaPlayPause => unsafe { (self.send_media_fn)(self.ptr, MediaCommand::PlayPause) },
+            MediaNext => unsafe { (self.send_media_fn)(self.ptr, MediaCommand::Next) },
+            MediaPrevious => unsafe { (self.send_media_fn)(self.ptr, MediaCommand::Previous) },
+            MediaStop => unsafe { (self.send_media_fn)(self.ptr, MediaCommand::Stop) },
+            VolumeUp => unsafe { (self.send_media_fn)(self.ptr, MediaCommand::VolumeUp) },
+            VolumeDown => unsafe { (self.send_media_fn)(self.ptr, MediaCommand::VolumeDown) },
+            VolumeMute => unsafe { (self.send_media_fn)(self.ptr, MediaCommand::VolumeMute) },
+            BrowserBack => unsafe { (self.send_key_fn)(self.ptr, SyntheticKey::BrowserBack) },
+            BrowserForward => unsafe { (self.send_key_fn)(self.ptr, SyntheticKey::BrowserForward) },
+            Passthrough | Block => {}
+        }
     }
 
     /// Send a media command
     #[allow(dead_code)]
     pub fn send_media(&self, cmd: MediaCommand) {
-        self.get().send_media(cmd);
+        unsafe { (self.send_media_fn)(self.ptr, cmd) }
     }
 
     /// Send a synthetic key
     #[allow(dead_code)]
     pub fn send_key(&self, key: SyntheticKey) {
-        self.get().send_key(key);
+        unsafe { (self.send_key_fn)(self.ptr, key) }
     }
 
     /// Get the active window info
     pub fn get_active_window(&self) -> WindowInfo {
-        self.get().get_active_window()
+        unsafe { (self.get_window_fn)(self.ptr) }
     }
 }
 
