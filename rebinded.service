@@ -1,0 +1,17 @@
+[Unit]
+Description=Rebinded key remapping daemon
+After=graphical-session.target
+Documentation=https://github.com/xevion/rebinded
+StartLimitIntervalSec=90
+StartLimitBurst=3
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/rebinded
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

@@ -25,3 +25,29 @@ format:
 # Run the daemon (forwards all args to cargo run)
 run *args:
     cargo run --bin rebinded {{args}}
+
+# Install rebinded binary and systemd service
+install:
+    cargo build --release
+    install -Dm755 target/release/rebinded ~/.local/bin/rebinded
+    mkdir -p ~/.config/systemd/user
+    install -Dm644 rebinded.service ~/.config/systemd/user/rebinded.service
+    systemctl --user daemon-reload
+    systemctl --user enable rebinded.service
+    @echo "✓ Installed! Start with: systemctl --user start rebinded"
+
+# Update rebinded (rebuild and restart)
+update:
+    cargo build --release
+    install -Dm755 target/release/rebinded ~/.local/bin/rebinded
+    systemctl --user restart rebinded.service
+    @echo "✓ Updated and restarted"
+
+# Uninstall rebinded
+uninstall:
+    -systemctl --user stop rebinded.service
+    -systemctl --user disable rebinded.service
+    rm -f ~/.config/systemd/user/rebinded.service
+    rm -f ~/.local/bin/rebinded
+    systemctl --user daemon-reload
+    @echo "✓ Uninstalled"
