@@ -50,17 +50,6 @@ impl MockPlatform {
         );
     }
 
-    /// Assert that a specific key was sent
-    pub fn assert_key_sent(&self, key: SyntheticKey) {
-        let calls = self.calls();
-        assert!(
-            calls.contains(&PlatformCall::SendKey(key)),
-            "Expected SendKey({:?}) but got calls: {:?}",
-            key,
-            calls
-        );
-    }
-
     /// Assert that no calls were made
     pub fn assert_no_calls(&self) {
         let calls = self.calls();

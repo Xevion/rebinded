@@ -2,6 +2,9 @@
 //!
 //! Provides rich diagnostic output using miette for configuration validation errors.
 
+// False positives from miette's derive macros - fields are used but rustc doesn't see it
+#![allow(unused_assignments)]
+
 use super::types::Span;
 use miette::{Diagnostic, NamedSource, SourceSpan};
 use thiserror::Error;
@@ -76,6 +79,7 @@ impl ConfigIssue {
 /// Individual validation issue wrapped for miette's `#[related]` attribute
 #[derive(Debug, Error, Diagnostic)]
 #[error("{message}")]
+#[allow(unused_assignments)] // Fields used by miette's derive macros
 pub struct ConfigIssueDiagnostic {
     message: String,
     #[label("{label}")]
@@ -96,6 +100,7 @@ pub struct ConfigIssueDiagnostic {
     s = if self.issues.len() == 1 { "" } else { "s" }
 )]
 #[diagnostic(code(rebinded::config::validation))]
+#[allow(unused_assignments)] // Fields used by miette's derive macros
 pub struct ConfigValidationError {
     #[source_code]
     src: NamedSource<String>,
@@ -108,6 +113,7 @@ impl ConfigValidationError {
     /// Create a validation error from collected issues
     ///
     /// Issues are sorted by source position for deterministic output.
+    #[allow(unused_assignments)] // Field assignments used by miette's derive macros
     pub fn new(
         source_name: impl Into<String>,
         source_content: String,
@@ -147,6 +153,7 @@ pub enum ConfigError {
 
     #[error("failed to parse config")]
     #[diagnostic(code(rebinded::config::parse))]
+    #[allow(unused_assignments)] // Fields used by miette's derive macros
     Parse {
         #[source_code]
         src: NamedSource<String>,
@@ -168,6 +175,7 @@ impl ConfigError {
         }
     }
 
+    #[allow(unused_assignments)] // Field assignments used by miette's derive macros
     pub fn parse(
         source_name: impl Into<String>,
         source_content: String,

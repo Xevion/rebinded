@@ -3,6 +3,12 @@
 //! Strategies transform key events into actions with optional stateful behavior.
 //! Examples include gated hold (require hold before activation), tap-vs-hold
 //! detection, and double-tap recognition.
+//!
+//! ## Public API
+//!
+//! This module exposes `PlatformHandle` and `StrategyContext` as public API
+//! for custom strategy implementations. Some methods may not be used internally
+//! but are available for strategy authors.
 
 mod gated_hold;
 
@@ -66,18 +72,20 @@ impl PlatformHandle {
     ///
     /// # Safety
     /// The caller must ensure the platform outlives all uses of this handle.
-    #[allow(dead_code)] // Used by platform-specific code
     pub fn new(platform: &Platform) -> Self {
         unsafe fn send_media_impl(ptr: *const (), cmd: MediaCommand) {
-            let platform = &*(ptr as *const Platform);
+            // SAFETY: Caller guarantees platform outlives all uses of this handle
+            let platform = unsafe { &*(ptr as *const Platform) };
             platform.send_media(cmd);
         }
         unsafe fn send_key_impl(ptr: *const (), key: SyntheticKey) {
-            let platform = &*(ptr as *const Platform);
+            // SAFETY: Caller guarantees platform outlives all uses of this handle
+            let platform = unsafe { &*(ptr as *const Platform) };
             platform.send_key(key);
         }
         unsafe fn get_window_impl(ptr: *const ()) -> WindowInfo {
-            let platform = &*(ptr as *const Platform);
+            // SAFETY: Caller guarantees platform outlives all uses of this handle
+            let platform = unsafe { &*(ptr as *const Platform) };
             platform.get_active_window()
         }
 
@@ -96,15 +104,18 @@ impl PlatformHandle {
     #[cfg(test)]
     pub unsafe fn from_mock(platform: &crate::platform::MockPlatform) -> Self {
         unsafe fn send_media_impl(ptr: *const (), cmd: MediaCommand) {
-            let platform = &*(ptr as *const crate::platform::MockPlatform);
+            // SAFETY: Caller guarantees MockPlatform outlives all uses of this handle
+            let platform = unsafe { &*(ptr as *const crate::platform::MockPlatform) };
             platform.send_media(cmd);
         }
         unsafe fn send_key_impl(ptr: *const (), key: SyntheticKey) {
-            let platform = &*(ptr as *const crate::platform::MockPlatform);
+            // SAFETY: Caller guarantees MockPlatform outlives all uses of this handle
+            let platform = unsafe { &*(ptr as *const crate::platform::MockPlatform) };
             platform.send_key(key);
         }
         unsafe fn get_window_impl(ptr: *const ()) -> WindowInfo {
-            let platform = &*(ptr as *const crate::platform::MockPlatform);
+            // SAFETY: Caller guarantees MockPlatform outlives all uses of this handle
+            let platform = unsafe { &*(ptr as *const crate::platform::MockPlatform) };
             platform.get_active_window()
         }
 
@@ -134,13 +145,17 @@ impl PlatformHandle {
     }
 
     /// Send a media command
-    #[allow(dead_code)]
+    ///
+    /// Public API method for custom strategies that need direct platform control.
+    #[allow(dead_code)] // Public API for custom strategy implementations
     pub fn send_media(&self, cmd: MediaCommand) {
         unsafe { (self.send_media_fn)(self.ptr, cmd) }
     }
 
     /// Send a synthetic key
-    #[allow(dead_code)]
+    ///
+    /// Public API method for custom strategies that need direct platform control.
+    #[allow(dead_code)] // Public API for custom strategy implementations
     pub fn send_key(&self, key: SyntheticKey) {
         unsafe { (self.send_key_fn)(self.ptr, key) }
     }
@@ -180,7 +195,9 @@ impl StrategyContext {
     ///
     /// Spawns an async task that sleeps for `delay` then executes the action.
     /// The task runs independently — this method returns immediately.
-    #[allow(dead_code)]
+    ///
+    /// Public API method for custom strategies implementing delayed actions.
+    #[allow(dead_code)] // Public API for custom strategy implementations
     pub fn execute_after(&self, delay: Duration) {
         let handle = self.platform_handle;
         let action = self.action.clone();
@@ -192,19 +209,25 @@ impl StrategyContext {
     }
 
     /// Get information about the currently focused window
-    #[allow(dead_code)]
+    ///
+    /// Public API method for context-aware strategies.
+    #[allow(dead_code)] // Public API for custom strategy implementations
     pub fn window_info(&self) -> WindowInfo {
         self.platform_handle.get_active_window()
     }
 
     /// Inject a synthetic key press
-    #[allow(dead_code)]
+    ///
+    /// Public API method for strategies that need to inject custom keys.
+    #[allow(dead_code)] // Public API for custom strategy implementations
     pub fn send_key(&self, key: SyntheticKey) {
         self.platform_handle.send_key(key);
     }
 
     /// Send a media command
-    #[allow(dead_code)]
+    ///
+    /// Public API method for strategies that need direct media control.
+    #[allow(dead_code)] // Public API for custom strategy implementations
     pub fn send_media(&self, cmd: MediaCommand) {
         self.platform_handle.send_media(cmd);
     }

@@ -29,21 +29,8 @@ impl<T> Spanned<T> {
         &self.value
     }
 
-    #[allow(dead_code)]
-    pub fn into_value(self) -> T {
-        self.value
-    }
-
     pub fn span(&self) -> &Span {
         &self.span
-    }
-
-    #[allow(dead_code)]
-    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Spanned<U> {
-        Spanned {
-            value: f(self.value),
-            span: self.span,
-        }
     }
 }
 
@@ -242,8 +229,12 @@ pub enum Action {
 impl Action {
     /// Execute this action using the platform.
     ///
+    /// This method is primarily used in tests and for direct platform execution.
+    /// In normal operation, prefer using `PlatformHandle::execute` or `StrategyContext::execute`.
+    ///
     /// Note: `Passthrough` and `Block` are handled at the event loop level,
     /// not here - calling execute on them is a no-op.
+    #[allow(dead_code)] // Public API for tests and direct platform usage
     pub fn execute(&self, platform: &impl crate::platform::PlatformInterface) {
         use crate::platform::{MediaCommand, SyntheticKey};
         use tracing::debug;

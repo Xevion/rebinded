@@ -897,7 +897,6 @@ mod tests {
     #[tokio::test]
     async fn test_mock_platform_records_actions() {
         use crate::config::Action;
-        use crate::key::{KeyCode, KeyEvent};
         use crate::platform::{MediaCommand, MockPlatform};
         use crate::strategy::{PlatformHandle, StrategyContext};
         use std::sync::Arc;

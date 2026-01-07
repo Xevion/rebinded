@@ -35,7 +35,6 @@ pub struct KeyCode(u32);
 
 impl KeyCode {
     /// Create a KeyCode from a raw platform-native code
-    #[allow(dead_code)] // Used by platform-specific code
     pub fn new(code: u32) -> Self {
         Self(code)
     }
@@ -78,7 +77,6 @@ pub struct KeyEvent {
 
 impl KeyEvent {
     /// Create a new key event
-    #[allow(dead_code)] // Used by platform-specific code
     pub fn new(key: KeyCode, down: bool) -> Self {
         Self { key, down }
     }
@@ -106,14 +104,6 @@ impl InputEvent {
         match self {
             InputEvent::Key(key_event) => InputEventId::Key(key_event.key),
             InputEvent::Scroll { up } => InputEventId::Scroll { up: *up },
-        }
-    }
-
-    /// Returns the KeyEvent if this is a key event
-    pub fn as_key(&self) -> Option<&KeyEvent> {
-        match self {
-            InputEvent::Key(key_event) => Some(key_event),
-            InputEvent::Scroll { .. } => None,
         }
     }
 }

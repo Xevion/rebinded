@@ -191,17 +191,17 @@ impl PlatformInterface for Platform {
             let response = handler(input_event, platform_handle).await;
 
             // Re-inject if passthrough
-            if response == EventResponse::Passthrough {
-                if let Some(ref uinput) = self.uinput_device {
-                    let device = StdArc::clone(uinput);
-                    let event = raw_event;
-                    tokio::spawn(async move {
-                        let mut dev = device.lock().await;
-                        if let Err(e) = dev.emit(&[event]) {
-                            warn!("failed to emit passthrough event: {}", e);
-                        }
-                    });
-                }
+            if response == EventResponse::Passthrough
+                && let Some(ref uinput) = self.uinput_device
+            {
+                let device = StdArc::clone(uinput);
+                let event = raw_event;
+                tokio::spawn(async move {
+                    let mut dev = device.lock().await;
+                    if let Err(e) = dev.emit(&[event]) {
+                        warn!("failed to emit passthrough event: {}", e);
+                    }
+                });
             }
         }
 
@@ -576,10 +576,10 @@ fn get_x11_window_title(
         .get_property(false, window, net_wm_name, utf8_string, 0, 1024)?
         .reply()?;
 
-    if !reply.value.is_empty() {
-        if let Ok(s) = String::from_utf8(reply.value) {
-            return Ok(s);
-        }
+    if !reply.value.is_empty()
+        && let Ok(s) = String::from_utf8(reply.value)
+    {
+        return Ok(s);
     }
 
     // Fallback to WM_NAME
@@ -685,7 +685,7 @@ async fn send_mpris_command(
     }
 
     // Create proxy for the player
-    let proxy = MediaPlayer2PlayerProxy::builder(&*conn)
+    let proxy = MediaPlayer2PlayerProxy::builder(&conn)
         .destination(player_name)?
         .build()
         .await?;
@@ -797,12 +797,11 @@ fn setup_panic_hook() {
 fn ungrab_all_devices() -> Result<()> {
     for entry in std::fs::read_dir("/dev/input")? {
         let path = entry?.path();
-        if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
-            if filename.starts_with("event") {
-                if let Ok(mut device) = Device::open(&path) {
-                    let _ = device.ungrab();
-                }
-            }
+        if let Some(filename) = path.file_name().and_then(|n| n.to_str())
+            && filename.starts_with("event")
+            && let Ok(mut device) = Device::open(&path)
+        {
+            let _ = device.ungrab();
         }
     }
     Ok(())
