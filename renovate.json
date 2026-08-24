@@ -1,4 +1,13 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["config:recommended"]
+  "extends": ["config:recommended"],
+  "description": [
+    "osvVulnerabilityAlerts is what makes Renovate raise security fixes here at all. The other path reads GitHub's Dependabot alert feed, and it defaults to off.",
+    "The vulnerabilityAlerts defaults already ungroup security fixes and raise them immediately; the block below only labels them."
+  ],
+  "osvVulnerabilityAlerts": true,
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "addLabels": ["security"]
+  }
 }

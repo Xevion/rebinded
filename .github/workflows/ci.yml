@@ -119,3 +119,20 @@ jobs:
 
       - name: Run tests
         run: cargo test --all-features
+
+  # Reports every advisory, but only fails on what a change introduces. Rust
+  # gates on the vulnerability class alone: unsound, unmaintained and yanked
+  # are real information and none of them is a statement about this program.
+  advisories:
+    name: Advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The baseline is scanned from a worktree, so the history has to be real.
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Xevion/advisory-action@master
