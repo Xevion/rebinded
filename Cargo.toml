@@ -24,6 +24,7 @@ clap = { version = "4", features = ["derive"] }
 dirs = "6"
 async-trait = "0.1.89"
 miette = { version = "7.6.0", features = ["fancy"] }
+crossbeam-channel = "0.5.15"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [

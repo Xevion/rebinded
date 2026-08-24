@@ -336,14 +336,22 @@ impl PlatformInterface for Platform {
 
 /// Set up XInput2 passive grabs for scroll wheel buttons (4=up, 5=down)
 /// Returns channels for scroll events (forward) and replay decisions (back)
-fn setup_xinput2_scroll_grab()
--> Result<(mpsc::UnboundedReceiver<bool>, mpsc::UnboundedSender<bool>)> {
+///
+/// Uses tokio channel for scroll events (async handler) and crossbeam for replay
+/// decisions (X11 thread blocks waiting for each decision synchronously).
+fn setup_xinput2_scroll_grab() -> Result<(
+    mpsc::UnboundedReceiver<bool>,
+    crossbeam_channel::Sender<bool>,
+)> {
     use x11rb::connection::Connection;
     use x11rb::protocol::xinput::{self, ConnectionExt as XInputExt, EventMask};
     use x11rb::protocol::xproto::GrabStatus;
 
+    // Tokio channel: X11 thread -> async handler (scroll events)
     let (scroll_tx, scroll_rx) = mpsc::unbounded_channel::<bool>();
-    let (replay_tx, mut replay_rx) = mpsc::unbounded_channel::<bool>();
+    // Crossbeam channel: async handler -> X11 thread (replay decisions)
+    // X11 thread will block on recv() to wait for each decision synchronously
+    let (replay_tx, replay_rx) = crossbeam_channel::unbounded::<bool>();
 
     // Connect to X11
     let (conn, screen_num) =
@@ -410,8 +418,11 @@ fn setup_xinput2_scroll_grab()
             button,
             vcp_device_id,
             xinput::GrabType::BUTTON,
-            xinput::GrabMode22::ASYNC,
-            x11rb::protocol::xproto::GrabMode::ASYNC,
+            // SYNC mode: events are FROZEN until XIAllowEvents is called
+            // - REPLAY_DEVICE: replay event as if grab never happened (passthrough)
+            // - ASYNC_DEVICE: resume normal processing (event consumed/blocked)
+            xinput::GrabMode22::SYNC,
+            x11rb::protocol::xproto::GrabMode::ASYNC, // paired device (keyboard) stays async
             xinput::GrabOwner::OWNER,
             &[u32::from(mask)],
             &[0], // any modifier
@@ -429,34 +440,20 @@ fn setup_xinput2_scroll_grab()
     conn.flush()?;
 
     // Spawn blocking thread to handle X11 events and replay decisions
+    // Uses crossbeam channel to synchronously wait for replay decisions,
+    // ensuring XIAllowEvents is called before moving to the next event.
     std::thread::spawn(move || {
-        loop {
-            // Non-blocking check for replay decisions first
-            while let Ok(should_replay) = replay_rx.try_recv() {
-                if should_replay {
-                    // Replay the event using XIAllowEvents with REPLAY_DEVICE mode
-                    // This causes the frozen event to be replayed as if the grab never happened
-                    use x11rb::protocol::xinput::{ConnectionExt as _, EventMode};
-                    if let Err(e) = conn.xinput_xi_allow_events(
-                        x11rb::CURRENT_TIME,
-                        xinput::Device::ALL,
-                        EventMode::REPLAY_DEVICE,
-                        0, // touchid (not used for button events)
-                        x11rb::NONE,
-                    ) {
-                        warn!("failed to replay scroll event: {}", e);
-                    }
-                } else {
-                    // Event was blocked, grab already consumed it - nothing to do
-                }
-            }
+        use x11rb::protocol::xinput::{ConnectionExt as _, EventMode};
 
+        loop {
             // Wait for next X11 event
             match conn.wait_for_event() {
                 Ok(event) => {
+                    // Debug: log ALL XInput events to see what's coming through
+                    trace!("X11 event received: {:?}", event);
+
                     // Handle scroll button presses (buttons 4=up, 5=down)
-                    // Filter by sourceid to only accept events from physical devices,
-                    // preventing infinite loops from previously re-injected events
+                    // Filter by sourceid to only accept events from physical devices
                     let scroll_up = match &event {
                         x11rb::protocol::Event::XinputButtonPress(ev)
                             if ev.detail == 4 && physical_pointer_ids.contains(&ev.sourceid) =>
@@ -471,10 +468,51 @@ fn setup_xinput2_scroll_grab()
                         _ => None,
                     };
 
-                    if let Some(up) = scroll_up
-                        && scroll_tx.send(up).is_err()
-                    {
-                        break; // Channel closed
+                    if let Some(up) = scroll_up {
+                        // Send scroll event to async handler
+                        if scroll_tx.send(up).is_err() {
+                            break; // Channel closed, exit
+                        }
+
+                        // CRITICAL: Block waiting for replay decision from handler
+                        // This ensures XIAllowEvents is called synchronously before
+                        // the X11 server times out and auto-replays the frozen event
+                        match replay_rx.recv() {
+                            Ok(should_replay) => {
+                                // With SYNC grab mode, device is frozen until XIAllowEvents
+                                let mode = if should_replay {
+                                    // Replay event as if grab never happened
+                                    EventMode::REPLAY_DEVICE
+                                } else {
+                                    // Resume processing, event is consumed (blocked)
+                                    EventMode::ASYNC_DEVICE
+                                };
+
+                                debug!(
+                                    "XIAllowEvents: mode={:?}, should_replay={}",
+                                    mode, should_replay
+                                );
+
+                                // Use VCP device ID (2) that we grabbed
+                                // Pass root window where grab was established
+                                if let Err(e) = conn.xinput_xi_allow_events(
+                                    x11rb::CURRENT_TIME,
+                                    vcp_device_id,
+                                    mode,
+                                    0,
+                                    root,
+                                ) {
+                                    warn!("failed to allow scroll event: {}", e);
+                                }
+                                if let Err(e) = conn.flush() {
+                                    warn!("failed to flush X11 connection: {}", e);
+                                }
+                            }
+                            Err(_) => {
+                                // Channel closed, exit
+                                break;
+                            }
+                        }
                     }
                 }
                 Err(e) => {

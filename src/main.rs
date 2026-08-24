@@ -3,7 +3,7 @@ mod key;
 mod platform;
 mod strategy;
 
-use clap::Parser;
+use clap::{ArgAction, Parser};
 use config::{Action, RuntimeConfig};
 use key::InputEvent;
 use platform::{EventResponse, Platform, PlatformInterface};
@@ -20,9 +20,9 @@ struct Args {
     #[arg(short, long)]
     config: Option<PathBuf>,
 
-    /// Enable verbose logging
-    #[arg(short, long)]
-    verbose: bool,
+    /// Enable verbose logging (use -v for debug, -vv for trace)
+    #[arg(short, long, action = ArgAction::Count)]
+    verbose: u8,
 }
 
 fn default_config_path() -> PathBuf {
@@ -37,10 +37,10 @@ async fn main() -> ExitCode {
     let args = Args::parse();
 
     // Initialize logging
-    let filter = if args.verbose {
-        EnvFilter::new(Level::DEBUG.to_string())
-    } else {
-        EnvFilter::from_default_env().add_directive(Level::INFO.into())
+    let filter = match args.verbose {
+        0 => EnvFilter::from_default_env().add_directive(Level::INFO.into()),
+        1 => EnvFilter::new(Level::DEBUG.to_string()),
+        _ => EnvFilter::new(Level::TRACE.to_string()),
     };
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
