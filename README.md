@@ -11,9 +11,9 @@ rebinded
 # Run with custom config
 rebinded --config /path/to/config.toml
 
-# With just (see Justfile)
-just run
-just run --release
+# With tempo (see tempo.config.ts)
+tempo start
+tempo start -- --release
 ```
 
 ## Configuration
@@ -63,9 +63,8 @@ All fields in a condition are ANDed. First matching rule wins.
 ## Development
 
 ```bash
-just check    # Run clippy
-just test     # Run tests
-just format   # Format code
+tempo check   # Run every check, clippy, and test CI runs
+tempo fmt     # Format code
 ```
 
 ## License
