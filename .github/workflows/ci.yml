@@ -135,4 +135,4 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - uses: Xevion/advisory-action@master
+      - uses: Xevion/advisory-action@v1
