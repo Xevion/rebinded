@@ -23,30 +23,23 @@ use std::time::Duration;
 
 /// Trait for key event processing strategies.
 ///
-/// Strategies receive key events and decide:
-/// 1. Whether to block or passthrough the original key event (returned quickly)
-/// 2. What actions to execute (via StrategyContext, can be immediate or delayed)
-///
-/// The `process` method must return quickly (< 100ms) to avoid OS hook timeouts.
-/// For delayed actions, return `Block` and spawn async work via the context.
+/// A strategy decides whether to block or pass through the original event, and
+/// what to execute via `StrategyContext`. `process` must return quickly to
+/// avoid OS hook timeouts; schedule anything slower on the context.
 #[async_trait]
 pub trait KeyStrategy: Send + Sync {
-    /// Additional events this strategy wants to receive (beyond its bound keys).
+    /// Additional events this strategy wants beyond its bound keys.
     ///
-    /// Strategies can subscribe to events like scroll wheel ticks that aren't
-    /// directly bound to the strategy. The event handler will route these
-    /// subscribed events to the strategy's `process` method.
-    ///
-    /// Default implementation returns an empty set (no extra subscriptions).
+    /// Lets a strategy receive things like scroll ticks that are not bound to
+    /// it. Defaults to none.
     fn subscriptions(&self) -> HashSet<InputEventId> {
         HashSet::new()
     }
 
     /// Process an input event.
     ///
-    /// Must return quickly (< 100ms recommended). For delayed actions,
-    /// return `EventResponse::Block` and use `ctx.execute_after()` to
-    /// schedule the action.
+    /// Must return quickly (< 100ms). For delayed actions return `Block` and
+    /// schedule via `ctx.execute_after()`.
     async fn process(&mut self, event: &InputEvent, ctx: &StrategyContext) -> EventResponse;
 }
 
@@ -167,11 +160,6 @@ impl PlatformHandle {
 }
 
 /// Context provided to strategies for action execution and platform queries.
-///
-/// Strategies use this to:
-/// - Execute actions immediately or after a delay
-/// - Query window information for conditional logic
-/// - Inject synthetic keys or media commands
 pub struct StrategyContext {
     platform_handle: PlatformHandle,
     action: Action,
@@ -194,7 +182,7 @@ impl StrategyContext {
     /// Execute the bound action after a delay.
     ///
     /// Spawns an async task that sleeps for `delay` then executes the action.
-    /// The task runs independently — this method returns immediately.
+    /// The task runs independently, so this method returns immediately.
     ///
     /// Public API method for custom strategies implementing delayed actions.
     #[allow(dead_code)] // Public API for custom strategy implementations

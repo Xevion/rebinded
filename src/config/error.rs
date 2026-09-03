@@ -2,7 +2,7 @@
 //!
 //! Provides rich diagnostic output using miette for configuration validation errors.
 
-// False positives from miette's derive macros - fields are used but rustc doesn't see it
+// False positives from miette's derive macros; the fields are used, but rustc doesn't see it
 #![allow(unused_assignments)]
 
 use super::types::Span;

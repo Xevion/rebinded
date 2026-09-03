@@ -14,22 +14,8 @@ use crate::platform;
 
 /// Platform-agnostic key code.
 ///
-/// Stores the raw OS-specific key code internally. Display names are queried
-/// from the OS on demand via `display_name()`, not stored in the struct.
-///
-/// # Examples
-///
-/// ```ignore
-/// // From platform-native code
-/// let key = KeyCode::new(0x7C); // VK_F13 on Windows
-///
-/// // Display name
-/// println!("Key pressed: {}", key.display_name()); // "F13"
-///
-/// // Parse from config string
-/// let key = KeyCode::from_config_str("f13").unwrap();
-/// let key = KeyCode::from_config_str("0x7C").unwrap();
-/// ```
+/// Stores the raw OS-specific code; display names are queried from the OS on
+/// demand rather than stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct KeyCode(u32);
 
@@ -37,6 +23,15 @@ impl KeyCode {
     /// Create a KeyCode from a raw platform-native code
     pub fn new(code: u32) -> Self {
         Self(code)
+    }
+
+    /// The raw platform-native code, for comparison against OS key sets
+    ///
+    /// Only platforms that claim individual devices need this; Windows hooks
+    /// the whole keyboard and never inspects it.
+    #[allow(dead_code)]
+    pub fn code(self) -> u32 {
+        self.0
     }
 
     /// Get human-readable display name from the OS
@@ -82,10 +77,6 @@ impl KeyEvent {
     }
 }
 
-// ============================================================================
-// Unified Input Events
-// ============================================================================
-
 /// A unified input event from the platform (keyboard or scroll)
 #[derive(Debug, Clone)]
 pub enum InputEvent {
@@ -127,8 +118,8 @@ impl InputEventId {
     /// Parse an event identifier from a config string
     ///
     /// Accepts:
-    /// - `"scroll_up"` → `Scroll { up: true }`
-    /// - `"scroll_down"` → `Scroll { up: false }`
+    /// - `"scroll_up"` -> `Scroll { up: true }`
+    /// - `"scroll_down"` -> `Scroll { up: false }`
     /// - Any valid key specifier (see `KeyCode::from_config_str`)
     pub fn from_config_str(s: &str) -> Option<Self> {
         let normalized = s.to_lowercase();
@@ -176,10 +167,6 @@ fn parse_key_specifier(s: &str) -> Option<KeyCode> {
     // Otherwise treat as name: "f13", "KEY_F13", etc.
     platform_key_from_name(s)
 }
-
-// ============================================================================
-// Platform-agnostic wrappers
-// ============================================================================
 
 fn platform_key_name(code: u32) -> String {
     platform::get_key_name(code)

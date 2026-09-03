@@ -1,16 +1,8 @@
 //! Platform abstraction layer
 //!
-//! Provides a unified interface for:
-//! - Input event capture (keyboard hooks)
-//! - Window information queries
-//! - Synthetic input (key simulation, media control)
-//! - Key name resolution (OS-specific key code <-> name mapping)
-//!
-//! Each platform module (windows.rs, linux.rs) exports a `Platform` struct that
-//! implements the `PlatformInterface` trait. The trait is the primary interface -
-//! all platform methods are called through it. Since only one platform is compiled
-//! per target (via cfg), the compiler monomorphizes all trait calls, giving us
-//! zero-cost abstraction with compile-time contract verification.
+//! Provides a unified interface for input capture, window queries, synthetic
+//! input, and key name resolution. Each platform module exports a `Platform`
+//! implementing `PlatformInterface`.
 
 #[cfg(unix)]
 mod linux;
@@ -58,10 +50,8 @@ pub enum SyntheticKey {
 
 /// Interface contract for platform implementations.
 ///
-/// Both `windows::Platform` and `linux::Platform` implement this trait.
-/// All platform methods are called through this trait. Since only one
-/// platform is compiled per target (via cfg), the compiler monomorphizes
-/// all calls - no vtable overhead.
+/// Only one platform is compiled per target, so calls monomorphize with no
+/// vtable overhead.
 #[allow(async_fn_in_trait)]
 pub trait PlatformInterface {
     /// Create a new platform instance
@@ -69,8 +59,15 @@ pub trait PlatformInterface {
     where
         Self: Sized;
 
-    /// Run the platform event loop with an async handler
-    async fn run<F, Fut>(&mut self, handler: F) -> anyhow::Result<()>
+    /// Run the platform event loop with an async handler.
+    ///
+    /// `bound_keys` is every key the config can act on; platforms that take
+    /// devices exclusively claim only those that can produce one.
+    async fn run<F, Fut>(
+        &mut self,
+        bound_keys: &std::collections::HashSet<crate::key::KeyCode>,
+        handler: F,
+    ) -> anyhow::Result<()>
     where
         F: FnMut(InputEvent, crate::strategy::PlatformHandle) -> Fut,
         Fut: Future<Output = EventResponse>;

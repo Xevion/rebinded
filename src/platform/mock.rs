@@ -84,12 +84,16 @@ impl PlatformInterface for MockPlatform {
         MockPlatform::new()
     }
 
-    async fn run<F, Fut>(&mut self, _handler: F) -> Result<()>
+    async fn run<F, Fut>(
+        &mut self,
+        _bound_keys: &std::collections::HashSet<crate::key::KeyCode>,
+        _handler: F,
+    ) -> Result<()>
     where
         F: FnMut(InputEvent, PlatformHandle) -> Fut,
         Fut: Future<Output = EventResponse>,
     {
-        // No-op for tests - tests don't call run()
+        // No-op; tests don't call run()
         Ok(())
     }
 

@@ -8,8 +8,8 @@
 //! This prevents accidental activation (e.g., bumping scroll wheel tilt) while
 //! allowing intentional rapid activation (e.g., skipping multiple tracks).
 //!
-//! Keys sharing the same `GatedHoldStrategy` instance share gate state — if one key
-//! opens the gate, sibling keys can activate immediately.
+//! Keys sharing the same `GatedHoldStrategy` instance share gate state: if one
+//! key opens the gate, sibling keys can activate immediately.
 
 use crate::config::Action;
 use crate::key::{InputEvent, InputEventId};
@@ -223,7 +223,7 @@ impl GatedHoldStrategy {
                     tokio::spawn(async move {
                         tokio::select! {
                             _ = tokio::time::sleep(hold_duration) => {
-                                // Hold threshold reached — execute action
+                                // Hold threshold reached, execute action
                                 platform_handle.execute(&action);
                                 debug!("gated_hold: hold timer fired, action executed");
 
@@ -273,19 +273,19 @@ impl GatedHoldStrategy {
                 debug!(key = key_name, "gated_hold: holding -> idle (cancelled)");
                 // Cancel the pending timer
                 let _ = cancel_tx.send(());
-                // Don't reinsert - absence from map means Idle
+                // Don't reinsert; absence from the map means Idle
             }
             KeyState::Active => {
                 debug!(key = key_name, "gated_hold: active -> idle");
                 // Record release time for repeat window
                 self.last_release = Some(Instant::now());
-                // Don't reinsert - absence from map means Idle
+                // Don't reinsert; absence from the map means Idle
             }
             KeyState::Diverted => {
                 debug!(key = key_name, "gated_hold: diverted -> idle");
-                // Don't record last_release here - it was already recorded when we
-                // transitioned to Diverted (if coming from Active)
-                // Don't reinsert - absence from map means Idle
+                // last_release was already recorded on the transition to
+                // Diverted, if that came from Active
+                // Don't reinsert; absence from the map means Idle
             }
             KeyState::Idle => {
                 // Already idle, nothing to do
@@ -413,10 +413,6 @@ mod tests {
             strategy.key_states.len()
         );
     }
-
-    // ========================================================================
-    // Divert State Transition Tests
-    // ========================================================================
 
     fn config_with_diverts() -> GatedHoldConfig {
         let mut diverts = HashMap::new();
@@ -683,10 +679,6 @@ mod tests {
             "key should remain in Active state"
         );
     }
-
-    // ========================================================================
-    // Timer Completion Tests
-    // ========================================================================
 
     #[tokio::test]
     async fn test_timer_completion_transitions_to_active() {

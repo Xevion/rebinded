@@ -42,14 +42,14 @@ impl<T> std::ops::Deref for Spanned<T> {
     }
 }
 
-/// Hash based on value only - span is metadata, not identity
+/// Hash based on value only; the span is metadata, not identity
 impl<T: Hash> Hash for Spanned<T> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.value.hash(state);
     }
 }
 
-/// Equality based on value only - span is metadata, not identity
+/// Equality based on value only; the span is metadata, not identity
 impl<T: PartialEq> PartialEq for Spanned<T> {
     fn eq(&self, other: &Self) -> bool {
         self.value == other.value
@@ -90,7 +90,7 @@ pub struct Binding {
     pub strategy: Option<Spanned<String>>,
 }
 
-/// Action specification - either simple or conditional
+/// Action specification, either simple or conditional
 #[derive(Debug, Clone)]
 pub enum ActionSpec {
     /// Simple action with no conditions
@@ -107,7 +107,7 @@ pub struct ConditionalAction {
     pub action: Action,
 }
 
-/// Window matching condition - all fields are ANDed together
+/// Window matching condition; all fields are ANDed together
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Condition {
     #[serde(default)]
@@ -193,7 +193,7 @@ impl WindowCondition {
 }
 
 /// Information about the currently focused window (filled by platform layer)
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct WindowInfo {
     pub title: String,
     pub class: String,
@@ -229,11 +229,9 @@ pub enum Action {
 impl Action {
     /// Execute this action using the platform.
     ///
-    /// This method is primarily used in tests and for direct platform execution.
-    /// In normal operation, prefer using `PlatformHandle::execute` or `StrategyContext::execute`.
-    ///
-    /// Note: `Passthrough` and `Block` are handled at the event loop level,
-    /// not here - calling execute on them is a no-op.
+    /// Prefer `PlatformHandle::execute` or `StrategyContext::execute` outside
+    /// tests. `Passthrough` and `Block` are handled by the event loop, so
+    /// executing them here is a no-op.
     #[allow(dead_code)] // Public API for tests and direct platform usage
     pub fn execute(&self, platform: &impl crate::platform::PlatformInterface) {
         use crate::platform::{MediaCommand, SyntheticKey};
@@ -257,9 +255,9 @@ impl Action {
 
     /// Returns the corresponding EventResponse for non-executable actions.
     ///
-    /// - `Passthrough` → `Some(EventResponse::Passthrough)`
-    /// - `Block` → `Some(EventResponse::Block)`
-    /// - All other actions → `None` (must be executed via platform)
+    /// - `Passthrough` -> `Some(EventResponse::Passthrough)`
+    /// - `Block` -> `Some(EventResponse::Block)`
+    /// - All other actions -> `None` (must be executed via platform)
     pub fn as_response(&self) -> Option<crate::platform::EventResponse> {
         match self {
             Action::Passthrough => Some(crate::platform::EventResponse::Passthrough),

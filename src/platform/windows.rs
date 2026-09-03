@@ -37,10 +37,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::PWSTR;
 
-// ============================================================================
-// Key Name Resolution
-// ============================================================================
-
 /// Keys without scan codes on standard keyboards (GetKeyNameTextW can't look them up)
 #[rustfmt::skip]
 const HARDCODED_KEYS: &[(&str, u32)] = &[
@@ -148,10 +144,6 @@ pub fn build_key_name_map() -> HashMap<String, u32> {
     map
 }
 
-// ============================================================================
-// Hook Thread
-// ============================================================================
-
 /// Channel message from hook thread to main thread
 struct HookEvent {
     event: InputEvent,
@@ -195,7 +187,13 @@ impl PlatformInterface for Platform {
     /// Captures keyboard and mouse wheel events and calls `handler` for each.
     /// The handler receives the event and a PlatformHandle for
     /// querying window info and executing actions.
-    async fn run<F, Fut>(&mut self, mut handler: F) -> Result<()>
+    // The low-level keyboard hook is global, so there are no devices to claim
+    // and nothing to narrow by binding.
+    async fn run<F, Fut>(
+        &mut self,
+        _bound_keys: &std::collections::HashSet<crate::key::KeyCode>,
+        mut handler: F,
+    ) -> Result<()>
     where
         F: FnMut(InputEvent, PlatformHandle) -> Fut,
         Fut: Future<Output = EventResponse>,
@@ -254,11 +252,7 @@ impl PlatformInterface for Platform {
     }
 }
 
-// ============================================================================
-// Hook Thread
-// ============================================================================
-
-/// Runs the Win32 message pump - must be called from a dedicated thread
+/// Runs the Win32 message pump; must be called from a dedicated thread
 fn run_hook_thread() -> Result<()> {
     unsafe {
         // Store thread ID so main thread can signal us to exit
@@ -275,7 +269,7 @@ fn run_hook_thread() -> Result<()> {
             .map_err(|e| anyhow!("failed to install mouse hook: {}", e))?;
         info!("mouse hook installed, starting message pump");
 
-        // Message pump - required for low-level hooks to work
+        // Message pump, required for low-level hooks to work
         // Exits when WM_QUIT is received (GetMessageW returns false)
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -396,10 +390,6 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
     }
 }
 
-// ============================================================================
-// Window Queries
-// ============================================================================
-
 /// Query information about the currently focused window
 fn get_foreground_window_info() -> WindowInfo {
     unsafe {
@@ -489,13 +479,9 @@ unsafe fn get_window_binary(hwnd: HWND) -> String {
     result
 }
 
-// ============================================================================
-// Synthetic Input
-// ============================================================================
-
 /// Send a synthetic key press (key down + key up)
 ///
-/// Spawns a thread to avoid blocking - some keys (especially media keys)
+/// Spawns a thread to avoid blocking; some keys (especially media keys)
 /// can block SendInput for 600ms+ while Windows processes them.
 fn send_key_press(vk: u16) {
     std::thread::spawn(move || send_key_press_sync(vk));

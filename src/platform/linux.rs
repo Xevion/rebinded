@@ -2,8 +2,13 @@
 //!
 //! Key components:
 //! - evdev for raw input device access and virtual device creation
-//! - X11 (via x11rb) for window queries
-//! - D-Bus (via zbus) for MPRIS media control and PulseAudio volume
+//! - X11 (via x11rb) for window queries and scroll wheel interception
+//! - D-Bus (via zbus) for MPRIS media control
+//!
+//! One dedicated thread owns the single X11 connection and both publishes the
+//! focused window and runs the scroll grab, so the two recover together and no
+//! blocking round trip lands on the tokio runtime that processes key events.
+//! `get_active_window` reads a cached snapshot.
 
 use super::{EventResponse, MediaCommand, PlatformInterface, SyntheticKey};
 use crate::config::WindowInfo;
@@ -16,14 +21,34 @@ use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc as StdArc, Mutex as StdMutex};
+use std::sync::{Arc as StdArc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, mpsc};
-use tracing::{debug, info, trace, warn};
+use tokio::sync::{Mutex, OnceCell, mpsc, watch};
+use tracing::{debug, error, info, trace, warn};
 
-// ============================================================================
-// Key Name Resolution
-// ============================================================================
+/// How long to wait before the first X11 reconnect attempt.
+const X11_RECONNECT_MIN: Duration = Duration::from_secs(1);
+/// Ceiling for the X11 reconnect backoff.
+const X11_RECONNECT_MAX: Duration = Duration::from_secs(30);
+/// Backstop for devices inotify missed, or that were busy when last tried.
+const DEVICE_RESCAN_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long the pointer may stay frozen deciding one scroll tick.
+///
+/// The grab freezes motion too, so exceeding this is felt as stutter.
+const POINTER_FREEZE_BUDGET: Duration = Duration::from_millis(4);
+
+/// Minimum gap between freeze warnings, so a slow run reports without flooding.
+const FREEZE_WARNING_INTERVAL: Duration = Duration::from_secs(10);
+
+/// X11 pointer names whose scroll events the grab must ignore.
+///
+/// Skipping our own device is what stops a replayed tick being recaptured.
+const SYNTHETIC_POINTER_NAMES: [&str; 4] = ["rebinded", "XTEST", "Virtual core", "ydotoold"];
+
+/// Name of the uinput device we re-inject through, and the name we refuse to
+/// grab so our own output cannot feed back in.
+const VIRTUAL_KEYBOARD_NAME: &str = "rebinded-virtual-keyboard";
 
 /// Get human-readable key name from Linux evdev code
 pub fn get_key_name(code: u32) -> String {
@@ -58,27 +83,50 @@ pub fn build_key_name_map() -> HashMap<String, u32> {
     map
 }
 
-// ============================================================================
-// Platform Implementation
-// ============================================================================
+/// The focused-window snapshot published by the X11 thread.
+///
+/// Poisoning is recovered from so a panic elsewhere cannot permanently
+/// disable window conditions.
+#[derive(Default)]
+struct WindowState {
+    info: StdRwLock<WindowInfo>,
+}
+
+impl WindowState {
+    fn get(&self) -> WindowInfo {
+        self.info
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn set(&self, next: WindowInfo) {
+        *self
+            .info
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = next;
+    }
+}
 
 /// Linux platform implementation
 pub struct Platform {
-    /// X11 connection for window queries (lazy-initialized)
-    x11_conn: Option<StdArc<Mutex<X11Connection>>>,
-    /// D-Bus connection for media control (lazy-initialized)
-    dbus_conn: Option<StdArc<zbus::Connection>>,
-    /// Virtual keyboard device for key injection (lazy-initialized)
+    /// Focused-window snapshot, republished by the X11 thread
+    window_state: StdArc<WindowState>,
+    /// Session bus connection, established once on first use and reused
+    dbus_conn: StdArc<OnceCell<zbus::Connection>>,
+    /// Virtual keyboard device for key injection
     /// Uses std::sync::Mutex (not tokio) to ensure synchronous, ordered event emission
     uinput_device: Option<StdArc<StdMutex<VirtualDevice>>>,
     /// MPRIS player state tracker for smart player selection
     mpris_tracker: StdArc<Mutex<MprisPlayerTracker>>,
 }
 
-/// X11 connection wrapper
-struct X11Connection {
-    conn: x11rb::rust_connection::RustConnection,
-    screen_num: usize,
+/// Message from a grabbed device's reader task
+enum DeviceMessage {
+    /// A raw event arrived from the given device
+    Event(evdev::InputEvent, PathBuf),
+    /// The device stopped producing events and is no longer held
+    Gone(PathBuf),
 }
 
 impl Default for Platform {
@@ -90,182 +138,157 @@ impl Default for Platform {
 impl PlatformInterface for Platform {
     fn new() -> Self {
         Self {
-            x11_conn: None,
-            dbus_conn: None,
+            window_state: StdArc::new(WindowState::default()),
+            dbus_conn: StdArc::new(OnceCell::new()),
             uinput_device: None,
             mpris_tracker: StdArc::new(Mutex::new(MprisPlayerTracker::new())),
         }
     }
 
-    async fn run<F, Fut>(&mut self, mut handler: F) -> Result<()>
+    async fn run<F, Fut>(&mut self, bound_keys: &HashSet<KeyCode>, mut handler: F) -> Result<()>
     where
         F: FnMut(InputEvent, PlatformHandle) -> Fut,
         Fut: Future<Output = EventResponse>,
     {
         info!("starting Linux input handler");
 
-        // Check permissions early with helpful error messages
         check_permissions()?;
-
-        // Set up panic hook to ungrab devices on crash
+        report_display_environment();
         setup_panic_hook();
 
-        // Find and grab all keyboard devices
-        let devices = find_keyboard_devices().await?;
-        if devices.is_empty() {
-            return Err(anyhow!("no keyboard devices found"));
+        let wanted: HashSet<evdev::KeyCode> = bound_keys
+            .iter()
+            .filter_map(|key| u16::try_from(key.code()).ok())
+            .map(evdev::KeyCode::new)
+            .collect();
+
+        if wanted.is_empty() {
+            warn!("no keys are bound; no devices will be grabbed");
         }
 
-        info!("found {} keyboard device(s)", devices.len());
+        // Holding a sender for the loop's lifetime keeps the channel open, so
+        // the select branch stays live even while no devices are held.
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<DeviceMessage>();
 
-        let mut grabbed_devices = Vec::new();
-        for path in devices {
-            match grab_device(&path).await {
-                Ok(device) => {
-                    info!(
-                        "grabbed device: {} ({})",
-                        device.name().unwrap_or("unknown"),
-                        path.display()
-                    );
-                    grabbed_devices.push((path, device));
-                }
-                Err(e) => {
-                    warn!("failed to grab {:?}: {}", path, e);
-                }
-            }
+        let mut held: HashSet<PathBuf> = HashSet::new();
+        for path in find_bindable_devices(&wanted)? {
+            grab_and_spawn(&path, &mut held, &event_tx);
         }
 
-        if grabbed_devices.is_empty() {
-            return Err(anyhow!("failed to grab any keyboard devices"));
+        if held.is_empty() {
+            error!(
+                "no keyboard devices could be grabbed; waiting for one to appear. \
+                 If another remapper holds them, stop it and rebinded will pick them up."
+            );
+        } else {
+            info!("grabbed {} keyboard device(s)", held.len());
         }
 
-        // Create virtual device for re-injection
-        let uinput = create_virtual_keyboard().await?;
+        let uinput = create_virtual_keyboard()?;
         self.uinput_device = Some(StdArc::new(StdMutex::new(uinput)));
         info!("created virtual keyboard for re-injection");
 
-        // Create event channel for merging device streams
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<(evdev::InputEvent, PathBuf)>();
+        // Hotplug: inotify tells us when a node appears or becomes readable.
+        let (hotplug_tx, mut hotplug_rx) = mpsc::unbounded_channel::<PathBuf>();
+        spawn_device_watcher(hotplug_tx);
 
-        // Spawn task for each device
-        let mut device_tasks = Vec::new();
-        for (path, device) in grabbed_devices {
-            let tx = event_tx.clone();
-            let task = tokio::spawn(async move {
-                if let Err(e) = process_device_events(device, path.clone(), tx).await {
-                    warn!("device {} stopped: {}", path.display(), e);
-                }
-            });
-            device_tasks.push(task);
-        }
-        drop(event_tx); // Drop original sender so channel closes when all tasks exit
+        // X11 thread: publishes window info and drives the scroll grab.
+        let (scroll_tx, mut scroll_rx) = mpsc::unbounded_channel::<bool>();
+        let (replay_tx, replay_rx) = crossbeam_channel::unbounded::<bool>();
+        let (window_tx, window_rx) = watch::channel(WindowInfo::default());
+        spawn_x11_thread(
+            StdArc::clone(&self.window_state),
+            scroll_tx,
+            replay_rx,
+            window_tx,
+        );
 
-        // Spawn MPRIS focus monitor task
-        // This tracks which media player windows are focused for smarter player selection
-        let tracker = StdArc::clone(&self.mpris_tracker);
-        let x11_conn = self.x11_conn.as_ref().map(StdArc::clone);
-        tokio::spawn(async move {
-            mpris_focus_monitor(x11_conn, tracker).await;
-        });
+        tokio::spawn(mpris_focus_monitor(
+            window_rx,
+            StdArc::clone(&self.mpris_tracker),
+            StdArc::clone(&self.dbus_conn),
+        ));
 
-        // Create platform handle for handler
         let platform_handle = PlatformHandle::new(self);
+        let mut rescan = tokio::time::interval(DEVICE_RESCAN_INTERVAL);
+        rescan.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        rescan.tick().await; // the first tick resolves immediately
 
-        // Set up XInput2 scroll handling (for scroll wheel bindings without grabbing mouse)
-        let (mut scroll_rx, replay_tx) = match setup_xinput2_scroll_grab() {
-            Ok((rx, tx)) => {
-                info!("XInput2 scroll grab active - scroll wheel bindings enabled");
-                (Some(rx), Some(tx))
-            }
-            Err(e) => {
-                warn!(
-                    "failed to set up XInput2 scroll grab: {}. Scroll wheel bindings will not work.",
-                    e
-                );
-                (None, None)
-            }
-        };
-
-        // Process events from both evdev (keyboard) and XInput2 (scroll)
-        // Mouse movement is not grabbed, so it goes directly through the physical device
         loop {
             tokio::select! {
-                // Handle keyboard events from evdev
-                Some((raw_event, _device_path)) = event_rx.recv() => {
-                    // Only process KEY events
-                    if raw_event.event_type() != EventType::KEY {
-                        continue;
-                    }
+                Some(message) = event_rx.recv() => {
+                    match message {
+                        DeviceMessage::Gone(path) => {
+                            held.remove(&path);
+                            if held.is_empty() {
+                                warn!(
+                                    "last keyboard device released ({}); \
+                                     waiting for a device to return",
+                                    path.display()
+                                );
+                            } else {
+                                info!("released device: {}", path.display());
+                            }
+                        }
+                        DeviceMessage::Event(raw_event, _path) => {
+                            if raw_event.event_type() != EventType::KEY {
+                                continue;
+                            }
+                            let Some(input_event) = convert_event(&raw_event) else {
+                                continue;
+                            };
 
-                    // Convert evdev InputEvent to our InputEvent
-                    let Some(input_event) = convert_event(&raw_event) else {
-                        continue;
-                    };
+                            trace!(?input_event, "processing keyboard event");
+                            let response = handler(input_event, platform_handle).await;
 
-                    trace!(?input_event, "processing keyboard event");
-
-                    // Call user handler
-                    let response = handler(input_event, platform_handle).await;
-
-                    // Re-inject if passthrough
-                    if response == EventResponse::Passthrough
-                        && let Some(ref uinput) = self.uinput_device
-                    {
-                        let mut dev = uinput.lock().unwrap();
-                        if let Err(e) = dev.emit(&[raw_event]) {
-                            warn!("failed to emit passthrough event: {}", e);
+                            if response == EventResponse::Passthrough
+                                && let Some(ref uinput) = self.uinput_device
+                            {
+                                let mut device = uinput
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                if let Err(e) = device.emit(&[raw_event]) {
+                                    warn!("failed to emit passthrough event: {}", e);
+                                }
+                            }
                         }
                     }
                 }
 
-                // Handle scroll events from XInput2
-                Some(scroll_up) = async {
-                    match &mut scroll_rx {
-                        Some(rx) => rx.recv().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
+                // Scroll ticks arrive frozen: the X11 thread is blocked until we
+                // answer, so this branch must always reply on replay_tx.
+                Some(scroll_up) = scroll_rx.recv() => {
                     let input_event = InputEvent::Scroll { up: scroll_up };
                     trace!(?input_event, "processing scroll event from XInput2");
 
-                    // Call user handler
                     let response = handler(input_event, platform_handle).await;
-
-                    // Send replay decision back to X11 thread
-                    // If passthrough: replay the event (as if grab never happened)
-                    // If blocked: do nothing (grab already consumed the event)
-                    if let Some(ref tx) = replay_tx {
-                        let should_replay = response == EventResponse::Passthrough;
-                        if let Err(e) = tx.send(should_replay) {
-                            warn!("failed to send scroll replay decision: {}", e);
-                        }
+                    let should_replay = response == EventResponse::Passthrough;
+                    if let Err(e) = replay_tx.send(should_replay) {
+                        warn!("failed to send scroll replay decision: {}", e);
                     }
                 }
 
-                // Exit when all event sources are closed
-                else => {
-                    info!("all event streams closed");
-                    break;
+                Some(path) = hotplug_rx.recv() => {
+                    if !held.contains(&path) && should_grab_device(&path, &wanted) {
+                        grab_and_spawn(&path, &mut held, &event_tx);
+                    }
+                }
+
+                _ = rescan.tick() => {
+                    if let Ok(paths) = find_bindable_devices(&wanted) {
+                        for path in paths {
+                            if !held.contains(&path) {
+                                grab_and_spawn(&path, &mut held, &event_tx);
+                            }
+                        }
+                    }
                 }
             }
         }
-
-        info!("all device streams closed, shutting down");
-        Ok(())
     }
 
     fn get_active_window(&self) -> WindowInfo {
-        // Try to get window info via X11, fall back to empty on any error
-        match get_x11_window_info(self.x11_conn.as_ref()) {
-            Ok(info) => info,
-            Err(e) => {
-                warn_once!(
-                    "X11 window query failed: {}. Window conditions will not work.",
-                    e
-                );
-                WindowInfo::default()
-            }
-        }
+        self.window_state.get()
     }
 
     fn send_key(&self, key: SyntheticKey) {
@@ -277,7 +300,6 @@ impl PlatformInterface for Platform {
             }
         };
 
-        // Map to key combinations
         let events = match key {
             SyntheticKey::BrowserBack => create_key_combo(&[
                 (evdev::KeyCode::KEY_LEFTALT, true),
@@ -295,8 +317,10 @@ impl PlatformInterface for Platform {
 
         // Emit in separate task to avoid blocking the handler
         tokio::spawn(async move {
-            let mut dev = uinput.lock().unwrap();
-            if let Err(e) = dev.emit(&events) {
+            let mut device = uinput
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Err(e) = device.emit(&events) {
                 warn!("failed to emit synthetic key: {}", e);
             } else {
                 debug!(?key, "emitted synthetic key");
@@ -305,15 +329,11 @@ impl PlatformInterface for Platform {
     }
 
     fn send_media(&self, cmd: MediaCommand) {
-        // Clone the D-Bus connection (will be lazy-initialized on first use)
-        let dbus_conn = self.dbus_conn.as_ref().map(StdArc::clone);
+        let dbus_conn = StdArc::clone(&self.dbus_conn);
         let tracker = StdArc::clone(&self.mpris_tracker);
-
-        // Capture current window info for smart player selection (before spawning)
         let window_info = self.get_active_window();
 
         tokio::spawn(async move {
-            // Handle volume commands via uinput (XF86Audio* keys)
             match cmd {
                 MediaCommand::VolumeUp | MediaCommand::VolumeDown | MediaCommand::VolumeMute => {
                     send_volume_command(cmd).await;
@@ -322,254 +342,582 @@ impl PlatformInterface for Platform {
                 _ => {}
             }
 
-            // Handle media commands via MPRIS D-Bus with smart player selection
-            if let Err(e) = send_mpris_command(dbus_conn, cmd, &window_info, tracker).await {
+            if let Err(e) = send_mpris_command(&dbus_conn, cmd, &window_info, tracker).await {
                 warn!("media command {:?} failed: {}", cmd, e);
             }
         });
     }
 }
 
-// ============================================================================
-// XInput2 Scroll Handling
-// ============================================================================
-
-/// Set up XInput2 passive grabs for scroll wheel buttons (4=up, 5=down)
-/// Returns channels for scroll events (forward) and replay decisions (back)
+/// Log what display server the process can actually reach.
 ///
-/// Uses tokio channel for scroll events (async handler) and crossbeam for replay
-/// decisions (X11 thread blocks waiting for each decision synchronously).
-fn setup_xinput2_scroll_grab() -> Result<(
-    mpsc::UnboundedReceiver<bool>,
-    crossbeam_channel::Sender<bool>,
-)> {
-    use x11rb::connection::Connection;
-    use x11rb::protocol::xinput::{self, ConnectionExt as XInputExt, EventMask};
-    use x11rb::protocol::xproto::GrabStatus;
+/// The environment is fixed at exec, so a missing DISPLAY is permanent.
+fn report_display_environment() {
+    let x11 = std::env::var("DISPLAY").ok().filter(|d| !d.is_empty());
+    let wayland = std::env::var("WAYLAND_DISPLAY")
+        .ok()
+        .filter(|d| !d.is_empty());
 
-    // Tokio channel: X11 thread -> async handler (scroll events)
-    let (scroll_tx, scroll_rx) = mpsc::unbounded_channel::<bool>();
-    // Crossbeam channel: async handler -> X11 thread (replay decisions)
-    // X11 thread will block on recv() to wait for each decision synchronously
-    let (replay_tx, replay_rx) = crossbeam_channel::unbounded::<bool>();
-
-    // Connect to X11
-    let (conn, screen_num) =
-        x11rb::connect(None).context("failed to connect to X11 for scroll grab")?;
-    let screen = &conn.setup().roots[screen_num];
-    let root = screen.root;
-
-    // Query XInput2 extension (need version 2.0+)
-    let xi_info = conn
-        .xinput_xi_query_version(2, 0)?
-        .reply()
-        .context("failed to query XInput2 version")?;
-    info!(
-        "XInput2 version {}.{}",
-        xi_info.major_version, xi_info.minor_version
-    );
-
-    // Query all XInput2 devices and build whitelist of physical pointer devices
-    // This prevents re-capturing our own re-injected scroll events from the virtual device
-    let devices_reply = conn
-        .xinput_xi_query_device(xinput::Device::ALL)?
-        .reply()
-        .context("failed to query XInput2 devices")?;
-
-    let mut physical_pointer_ids: HashSet<u16> = HashSet::new();
-    for info in &devices_reply.infos {
-        // Only include slave pointer devices (physical input devices)
-        if info.type_ == xinput::DeviceType::SLAVE_POINTER {
-            let name = String::from_utf8_lossy(&info.name);
-            // Exclude virtual devices by name pattern
-            if !name.contains("Virtual") && !name.contains("XTEST") && !name.contains("rebinded") {
-                physical_pointer_ids.insert(info.deviceid);
-                debug!(
-                    "Whitelisted physical pointer: {} (id={})",
-                    name.trim_end_matches('\0'),
-                    info.deviceid
-                );
-            }
-        }
+    match (&x11, &wayland) {
+        (Some(x11), _) => info!("X11 display {}", x11),
+        (None, Some(wayland)) => warn!(
+            "running under Wayland ({}) with no DISPLAY; window conditions and \
+             scroll bindings require X11 or XWayland and will be unavailable",
+            wayland
+        ),
+        (None, None) => warn!(
+            "DISPLAY is not set; window conditions and scroll bindings will be \
+             unavailable. Under systemd, the unit must be WantedBy=graphical-session.target \
+             so it starts after the session exports DISPLAY."
+        ),
     }
-    info!(
-        "Found {} physical pointer device(s) for scroll filtering",
-        physical_pointer_ids.len()
-    );
+}
 
-    // CRITICAL: Select events on root window BEFORE setting up grabs
-    // Without this, the X11 server won't deliver any events to us
-    let mask = xinput::XIEventMask::BUTTON_PRESS | xinput::XIEventMask::BUTTON_RELEASE;
-    let event_mask = EventMask {
-        deviceid: xinput::Device::ALL.into(),
-        mask: vec![mask],
-    };
-    conn.xinput_xi_select_events(root, &[event_mask])?;
-    debug!("XInput2 event selection registered on root window");
+/// Atoms interned once per connection.
+struct Atoms {
+    net_active_window: u32,
+    net_wm_name: u32,
+    net_wm_pid: u32,
+    utf8_string: u32,
+    window: u32,
+    cardinal: u32,
+}
 
-    // Set up passive grabs for buttons 4 (scroll up) and 5 (scroll down)
-    // Use device ID 2 (VCP - Virtual Core Pointer) for passive grabs
-    let vcp_device_id: u16 = 2;
-    for button in [4u32, 5u32] {
-        let result = conn.xinput_xi_passive_grab_device(
-            x11rb::CURRENT_TIME,
-            root,
-            0, // no cursor change
-            button,
-            vcp_device_id,
-            xinput::GrabType::BUTTON,
-            // SYNC mode: events are FROZEN until XIAllowEvents is called
-            // - REPLAY_DEVICE: replay event as if grab never happened (passthrough)
-            // - ASYNC_DEVICE: resume normal processing (event consumed/blocked)
-            xinput::GrabMode22::SYNC,
-            x11rb::protocol::xproto::GrabMode::ASYNC, // paired device (keyboard) stays async
-            xinput::GrabOwner::OWNER,
-            &[u32::from(mask)],
-            &[0], // any modifier
-        )?;
-        let reply = result.reply()?;
-        if !reply.modifiers.is_empty() && reply.modifiers[0].status != GrabStatus::SUCCESS {
-            warn!(
-                "failed to grab button {}: {:?}",
-                button, reply.modifiers[0].status
-            );
-        } else {
-            debug!("passive grab set up for button {}", button);
-        }
+impl Atoms {
+    fn intern(conn: &x11rb::rust_connection::RustConnection) -> Result<Self> {
+        use x11rb::protocol::xproto::ConnectionExt as _;
+
+        // Issue every request before collecting replies so this costs one round
+        // trip rather than six.
+        let net_active_window = conn.intern_atom(false, b"_NET_ACTIVE_WINDOW")?;
+        let net_wm_name = conn.intern_atom(false, b"_NET_WM_NAME")?;
+        let net_wm_pid = conn.intern_atom(false, b"_NET_WM_PID")?;
+        let utf8_string = conn.intern_atom(false, b"UTF8_STRING")?;
+        let window = conn.intern_atom(false, b"WINDOW")?;
+        let cardinal = conn.intern_atom(false, b"CARDINAL")?;
+
+        Ok(Self {
+            net_active_window: net_active_window.reply()?.atom,
+            net_wm_name: net_wm_name.reply()?.atom,
+            net_wm_pid: net_wm_pid.reply()?.atom,
+            utf8_string: utf8_string.reply()?.atom,
+            window: window.reply()?.atom,
+            cardinal: cardinal.reply()?.atom,
+        })
     }
-    conn.flush()?;
+}
 
-    // Spawn blocking thread to handle X11 events and replay decisions
-    // Uses crossbeam channel to synchronously wait for replay decisions,
-    // ensuring XIAllowEvents is called before moving to the next event.
-    std::thread::spawn(move || {
-        use x11rb::protocol::xinput::{ConnectionExt as _, EventMode};
+/// Spawn the thread that owns the X11 connection.
+///
+/// Reconnects with backoff, so a display that is not up yet resolves itself.
+fn spawn_x11_thread(
+    window_state: StdArc<WindowState>,
+    scroll_tx: mpsc::UnboundedSender<bool>,
+    replay_rx: crossbeam_channel::Receiver<bool>,
+    window_tx: watch::Sender<WindowInfo>,
+) {
+    let spawned = std::thread::Builder::new()
+        .name("rebinded-x11".to_string())
+        .spawn(move || {
+            let mut backoff = X11_RECONNECT_MIN;
+            let mut announced_failure = false;
 
-        loop {
-            // Wait for next X11 event
-            match conn.wait_for_event() {
-                Ok(event) => {
-                    // Debug: log ALL XInput events to see what's coming through
-                    trace!("X11 event received: {:?}", event);
-
-                    // Handle scroll button presses (buttons 4=up, 5=down)
-                    // Filter by sourceid to only accept events from physical devices
-                    let scroll_up = match &event {
-                        x11rb::protocol::Event::XinputButtonPress(ev)
-                            if ev.detail == 4 && physical_pointer_ids.contains(&ev.sourceid) =>
-                        {
-                            Some(true)
-                        }
-                        x11rb::protocol::Event::XinputButtonPress(ev)
-                            if ev.detail == 5 && physical_pointer_ids.contains(&ev.sourceid) =>
-                        {
-                            Some(false)
-                        }
-                        _ => None,
-                    };
-
-                    if let Some(up) = scroll_up {
-                        // Send scroll event to async handler
-                        if scroll_tx.send(up).is_err() {
-                            break; // Channel closed, exit
-                        }
-
-                        // CRITICAL: Block waiting for replay decision from handler
-                        // This ensures XIAllowEvents is called synchronously before
-                        // the X11 server times out and auto-replays the frozen event
-                        match replay_rx.recv() {
-                            Ok(should_replay) => {
-                                // With SYNC grab mode, device is frozen until XIAllowEvents
-                                let mode = if should_replay {
-                                    // Replay event as if grab never happened
-                                    EventMode::REPLAY_DEVICE
-                                } else {
-                                    // Resume processing, event is consumed (blocked)
-                                    EventMode::ASYNC_DEVICE
-                                };
-
-                                debug!(
-                                    "XIAllowEvents: mode={:?}, should_replay={}",
-                                    mode, should_replay
-                                );
-
-                                // Use VCP device ID (2) that we grabbed
-                                // Pass root window where grab was established
-                                if let Err(e) = conn.xinput_xi_allow_events(
-                                    x11rb::CURRENT_TIME,
-                                    vcp_device_id,
-                                    mode,
-                                    0,
-                                    root,
-                                ) {
-                                    warn!("failed to allow scroll event: {}", e);
-                                }
-                                if let Err(e) = conn.flush() {
-                                    warn!("failed to flush X11 connection: {}", e);
-                                }
-                            }
-                            Err(_) => {
-                                // Channel closed, exit
-                                break;
-                            }
+            loop {
+                match x11_session(&window_state, &scroll_tx, &replay_rx, &window_tx) {
+                    Ok(()) => {
+                        debug!("X11 thread stopping; event channel closed");
+                        return;
+                    }
+                    Err(e) => {
+                        // Announce the first failure, then stay quiet: a display
+                        // that is not up yet should not spam the journal.
+                        if announced_failure {
+                            debug!("X11 session ended: {}", e);
+                        } else {
+                            warn!(
+                                "X11 unavailable: {}. Window conditions and scroll bindings \
+                                 are disabled until it returns; retrying in the background.",
+                                e
+                            );
+                            announced_failure = true;
                         }
                     }
                 }
-                Err(e) => {
-                    warn!("X11 event error: {}", e);
-                    break;
-                }
-            }
-        }
-    });
 
-    Ok((scroll_rx, replay_tx))
+                // Stale window info is worse than none: a condition matching a
+                // window that no longer has focus fires the wrong action.
+                window_state.set(WindowInfo::default());
+                let _ = window_tx.send(WindowInfo::default());
+
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(X11_RECONNECT_MAX);
+            }
+        });
+
+    if let Err(e) = spawned {
+        error!(
+            "failed to spawn X11 thread: {}. Window conditions and scroll bindings \
+             will be unavailable.",
+            e
+        );
+    }
 }
 
-// ============================================================================
-// Device Management
-// ============================================================================
+/// One connected X11 session: set up, then serve events until the connection drops.
+fn x11_session(
+    window_state: &StdArc<WindowState>,
+    scroll_tx: &mpsc::UnboundedSender<bool>,
+    replay_rx: &crossbeam_channel::Receiver<bool>,
+    window_tx: &watch::Sender<WindowInfo>,
+) -> Result<()> {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::Event;
+    use x11rb::protocol::xproto::{ChangeWindowAttributesAux, ConnectionExt as _, EventMask};
 
-/// Find keyboard input devices (excluding mice to avoid virtual device sensitivity issues)
+    let (conn, screen_num) = x11rb::connect(None).context("failed to connect")?;
+    let root = conn.setup().roots[screen_num].root;
+    let atoms = Atoms::intern(&conn).context("failed to intern atoms")?;
+
+    // Watch the root for focus changes.
+    conn.change_window_attributes(
+        root,
+        &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+    )?
+    .check()
+    .context("failed to select property events on root")?;
+
+    let scroll = ScrollGrab::establish(&conn, root)?;
+    info!("X11 connected; window conditions active");
+    if scroll.is_some() {
+        info!("XInput2 scroll grab active; scroll wheel bindings enabled");
+    }
+
+    // Publish once up front so bindings work before the first focus change.
+    let mut tracked = publish_window(&conn, &atoms, root, None, window_state, window_tx);
+    let mut last_freeze_warning: Option<Instant> = None;
+
+    loop {
+        let event = conn.wait_for_event().context("connection lost")?;
+
+        match event {
+            // Browsers retitle on tab switch without changing
+            // _NET_ACTIVE_WINDOW, so the window is watched as well as root.
+            Event::PropertyNotify(ev)
+                if (ev.window == root && ev.atom == atoms.net_active_window)
+                    || (Some(ev.window) == tracked
+                        && (ev.atom == atoms.net_wm_name
+                            || ev.atom
+                                == u32::from(x11rb::protocol::xproto::AtomEnum::WM_NAME))) =>
+            {
+                tracked = publish_window(&conn, &atoms, root, tracked, window_state, window_tx);
+            }
+
+            Event::XinputButtonPress(ev) => {
+                let Some(grab) = scroll.as_ref() else {
+                    continue;
+                };
+                let Some(up) = grab.classify(&ev) else {
+                    continue;
+                };
+
+                // The device is frozen until XIAllowEvents. If the handler is
+                // gone we must still thaw it, or the pointer stays stuck.
+                let frozen_since = Instant::now();
+                let should_replay = if scroll_tx.send(up).is_ok() {
+                    replay_rx.recv().unwrap_or(true)
+                } else {
+                    grab.allow(&conn, true);
+                    return Ok(());
+                };
+
+                grab.allow(&conn, should_replay);
+
+                let frozen = frozen_since.elapsed();
+                if frozen > POINTER_FREEZE_BUDGET
+                    && last_freeze_warning
+                        .is_none_or(|last| last.elapsed() >= FREEZE_WARNING_INTERVAL)
+                {
+                    warn!(
+                        "pointer frozen {:?} deciding one scroll tick (budget {:?}); \
+                         mouse motion stalls this long on every tick while scrolling",
+                        frozen, POINTER_FREEZE_BUDGET
+                    );
+                    last_freeze_warning = Some(Instant::now());
+                } else {
+                    trace!("scroll tick decided in {:?}", frozen);
+                }
+            }
+
+            _ => {}
+        }
+    }
+}
+
+/// Re-read the focused window and publish it if it changed.
 ///
-/// We only grab keyboards via evdev. Scroll wheel events are intercepted via XInput2
-/// at the X11 level, so we don't need to grab mouse devices.
-async fn find_keyboard_devices() -> Result<Vec<PathBuf>> {
+/// Returns the window now being tracked for title changes.
+fn publish_window(
+    conn: &x11rb::rust_connection::RustConnection,
+    atoms: &Atoms,
+    root: u32,
+    tracked: Option<u32>,
+    window_state: &StdArc<WindowState>,
+    window_tx: &watch::Sender<WindowInfo>,
+) -> Option<u32> {
+    use x11rb::protocol::xproto::{ChangeWindowAttributesAux, ConnectionExt as _, EventMask};
+
+    let active = match active_window_id(conn, atoms, root) {
+        Ok(id) => id,
+        Err(e) => {
+            debug!("failed to read active window: {}", e);
+            return tracked;
+        }
+    };
+
+    if active != tracked {
+        // Stop listening to the window we are leaving; it may already be gone,
+        // so errors here are expected and ignored.
+        if let Some(previous) = tracked {
+            conn.change_window_attributes(
+                previous,
+                &ChangeWindowAttributesAux::new().event_mask(EventMask::NO_EVENT),
+            )
+            .map(|cookie| cookie.ignore_error())
+            .ok();
+        }
+        if let Some(current) = active {
+            conn.change_window_attributes(
+                current,
+                &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+            )
+            .map(|cookie| cookie.ignore_error())
+            .ok();
+        }
+    }
+
+    let info = match active {
+        Some(window) => query_window_info(conn, atoms, window),
+        None => WindowInfo::default(),
+    };
+
+    if window_state.get() != info {
+        trace!(?info, "focused window changed");
+        window_state.set(info.clone());
+        let _ = window_tx.send(info);
+    }
+
+    active
+}
+
+/// Read `_NET_ACTIVE_WINDOW` from the root window.
+fn active_window_id(
+    conn: &x11rb::rust_connection::RustConnection,
+    atoms: &Atoms,
+    root: u32,
+) -> Result<Option<u32>> {
+    use x11rb::protocol::xproto::ConnectionExt as _;
+
+    let reply = conn
+        .get_property(false, root, atoms.net_active_window, atoms.window, 0, 1)?
+        .reply()?;
+
+    if reply.value.len() < 4 {
+        return Ok(None);
+    }
+
+    let id = u32::from_ne_bytes([
+        reply.value[0],
+        reply.value[1],
+        reply.value[2],
+        reply.value[3],
+    ]);
+
+    // Some window managers publish 0 to mean "nothing focused".
+    Ok((id != 0).then_some(id))
+}
+
+/// Collect title, class and binary for a window. Missing pieces are left empty.
+fn query_window_info(
+    conn: &x11rb::rust_connection::RustConnection,
+    atoms: &Atoms,
+    window: u32,
+) -> WindowInfo {
+    WindowInfo {
+        title: window_title(conn, atoms, window).unwrap_or_default(),
+        class: window_class(conn, window).unwrap_or_default(),
+        binary: window_binary(conn, atoms, window).unwrap_or_default(),
+    }
+}
+
+/// Get window title, preferring the UTF-8 `_NET_WM_NAME` over legacy `WM_NAME`.
+fn window_title(
+    conn: &x11rb::rust_connection::RustConnection,
+    atoms: &Atoms,
+    window: u32,
+) -> Result<String> {
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _};
+
+    let reply = conn
+        .get_property(false, window, atoms.net_wm_name, atoms.utf8_string, 0, 1024)?
+        .reply()?;
+
+    if !reply.value.is_empty()
+        && let Ok(title) = String::from_utf8(reply.value)
+    {
+        return Ok(title);
+    }
+
+    let reply = conn
+        .get_property(false, window, AtomEnum::WM_NAME, AtomEnum::STRING, 0, 1024)?
+        .reply()?;
+
+    Ok(String::from_utf8_lossy(&reply.value).into_owned())
+}
+
+/// Get window class (second element of `WM_CLASS`)
+fn window_class(conn: &x11rb::rust_connection::RustConnection, window: u32) -> Result<String> {
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _};
+
+    let reply = conn
+        .get_property(false, window, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 1024)?
+        .reply()?;
+
+    // WM_CLASS format: "instance\0class\0"
+    let value = String::from_utf8_lossy(&reply.value);
+    Ok(value.split('\0').nth(1).unwrap_or("").to_string())
+}
+
+/// Get window binary name by resolving `_NET_WM_PID` through /proc
+fn window_binary(
+    conn: &x11rb::rust_connection::RustConnection,
+    atoms: &Atoms,
+    window: u32,
+) -> Result<String> {
+    use x11rb::protocol::xproto::ConnectionExt as _;
+
+    let reply = conn
+        .get_property(false, window, atoms.net_wm_pid, atoms.cardinal, 0, 1)?
+        .reply()?;
+
+    if reply.value.len() < 4 {
+        return Ok(String::new());
+    }
+
+    let pid = u32::from_ne_bytes([
+        reply.value[0],
+        reply.value[1],
+        reply.value[2],
+        reply.value[3],
+    ]);
+
+    let exe = std::fs::read_link(format!("/proc/{}/exe", pid))?;
+    Ok(exe
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default())
+}
+
+/// An active XInput2 passive grab on the scroll wheel buttons.
+struct ScrollGrab {
+    /// Master pointer the grab was established on
+    pointer: u16,
+    /// Root window the grab was established on
+    root: u32,
+    /// Slave pointers whose events we accept, keyed by XInput source id
+    physical: HashSet<u16>,
+}
+
+impl ScrollGrab {
+    /// Grab scroll up/down on the master pointer.
+    ///
+    /// `Ok(None)` means no usable XInput2; window conditions still work.
+    fn establish(conn: &x11rb::rust_connection::RustConnection, root: u32) -> Result<Option<Self>> {
+        use x11rb::connection::Connection;
+        use x11rb::protocol::xinput::{self, ConnectionExt as _, EventMask};
+        use x11rb::protocol::xproto::GrabStatus;
+
+        let version = conn
+            .xinput_xi_query_version(2, 0)
+            .map_err(anyhow::Error::from)
+            .and_then(|cookie| cookie.reply().map_err(anyhow::Error::from));
+
+        let version = match version {
+            Ok(version) => version,
+            Err(e) => {
+                warn!(
+                    "XInput2 unavailable ({}); scroll wheel bindings will not work",
+                    e
+                );
+                return Ok(None);
+            }
+        };
+        debug!(
+            "XInput2 version {}.{}",
+            version.major_version, version.minor_version
+        );
+
+        let devices = conn.xinput_xi_query_device(xinput::Device::ALL)?.reply()?;
+
+        // Grab on the master pointer rather than assuming the conventional id 2.
+        let Some(pointer) = devices
+            .infos
+            .iter()
+            .find(|info| info.type_ == xinput::DeviceType::MASTER_POINTER)
+            .map(|info| info.deviceid)
+        else {
+            warn!("no master pointer found; scroll wheel bindings will not work");
+            return Ok(None);
+        };
+
+        let physical: HashSet<u16> = devices
+            .infos
+            .iter()
+            .filter(|info| info.type_ == xinput::DeviceType::SLAVE_POINTER)
+            .filter(|info| {
+                let name = String::from_utf8_lossy(&info.name);
+                !SYNTHETIC_POINTER_NAMES
+                    .iter()
+                    .any(|synthetic| name.contains(synthetic))
+            })
+            .map(|info| {
+                debug!(
+                    "accepting scroll from pointer {} (id={})",
+                    String::from_utf8_lossy(&info.name).trim_end_matches('\0'),
+                    info.deviceid
+                );
+                info.deviceid
+            })
+            .collect();
+
+        if physical.is_empty() {
+            warn!("no physical pointer devices found; scroll wheel bindings will not work");
+            return Ok(None);
+        }
+
+        let mask = xinput::XIEventMask::BUTTON_PRESS | xinput::XIEventMask::BUTTON_RELEASE;
+
+        // The server delivers nothing unless events are selected on the root
+        // before the grabs are established.
+        conn.xinput_xi_select_events(
+            root,
+            &[EventMask {
+                deviceid: xinput::Device::ALL.into(),
+                mask: vec![mask],
+            }],
+        )?
+        .check()
+        .context("failed to select XInput2 events on root")?;
+
+        for button in [4u32, 5u32] {
+            let reply = conn
+                .xinput_xi_passive_grab_device(
+                    x11rb::CURRENT_TIME,
+                    root,
+                    0, // no cursor change
+                    button,
+                    pointer,
+                    xinput::GrabType::BUTTON,
+                    // SYNC freezes the device until XIAllowEvents decides
+                    // between REPLAY_DEVICE (passthrough) and ASYNC_DEVICE (block).
+                    xinput::GrabMode22::SYNC,
+                    x11rb::protocol::xproto::GrabMode::ASYNC,
+                    xinput::GrabOwner::OWNER,
+                    &[u32::from(mask)],
+                    &[0], // any modifier
+                )?
+                .reply()?;
+
+            if let Some(status) = reply.modifiers.first()
+                && status.status != GrabStatus::SUCCESS
+            {
+                warn!("failed to grab button {}: {:?}", button, status.status);
+            }
+        }
+        conn.flush()?;
+
+        Ok(Some(Self {
+            pointer,
+            root,
+            physical,
+        }))
+    }
+
+    /// Map a button press to a scroll direction, ignoring synthetic sources.
+    fn classify(&self, ev: &x11rb::protocol::xinput::ButtonPressEvent) -> Option<bool> {
+        if !self.physical.contains(&ev.sourceid) {
+            return None;
+        }
+        match ev.detail {
+            4 => Some(true),
+            5 => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Thaw the frozen device, either replaying the event or consuming it.
+    fn allow(&self, conn: &x11rb::rust_connection::RustConnection, replay: bool) {
+        use x11rb::connection::Connection;
+        use x11rb::protocol::xinput::{ConnectionExt as _, EventMode};
+
+        let mode = if replay {
+            EventMode::REPLAY_DEVICE
+        } else {
+            EventMode::ASYNC_DEVICE
+        };
+
+        if let Err(e) =
+            conn.xinput_xi_allow_events(x11rb::CURRENT_TIME, self.pointer, mode, 0, self.root)
+        {
+            warn!("failed to thaw scroll event: {}", e);
+        }
+        if let Err(e) = conn.flush() {
+            warn!("failed to flush X11 connection: {}", e);
+        }
+    }
+}
+
+/// Whether a device should be taken over exclusively.
+///
+/// Only devices that can produce a bound key are claimed. Motion devices never
+/// are: re-injecting REL_X/REL_Y loses the DPI properties libinput accelerates
+/// with, which changes how the mouse feels.
+fn should_grab_device(path: &Path, wanted: &HashSet<evdev::KeyCode>) -> bool {
+    let Ok(device) = Device::open(path) else {
+        return false;
+    };
+
+    if device.name() == Some(VIRTUAL_KEYBOARD_NAME) {
+        return false;
+    }
+
+    let has_motion = device
+        .supported_relative_axes()
+        .map(|axes| axes.contains(RelativeAxisCode::REL_X))
+        .unwrap_or(false);
+
+    if has_motion {
+        return false;
+    }
+
+    device
+        .supported_keys()
+        .map(|keys| wanted.iter().any(|key| keys.contains(*key)))
+        .unwrap_or(false)
+}
+
+/// Find every device that can produce a bound key
+fn find_bindable_devices(wanted: &HashSet<evdev::KeyCode>) -> Result<Vec<PathBuf>> {
     let mut devices = Vec::new();
 
     for entry in std::fs::read_dir("/dev/input").context("failed to read /dev/input directory")? {
-        let entry = entry?;
-        let path = entry.path();
+        let path = entry?.path();
 
-        // Only check event* devices
-        let Some(filename) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if !filename.starts_with("event") {
-            continue;
-        }
+        let is_event_node = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("event"));
 
-        // Try to open device to check capabilities
-        let Ok(device) = Device::open(&path) else {
-            continue;
-        };
-
-        // Check if device has keyboard capability (letter keys or function keys)
-        let has_keyboard = device
-            .supported_keys()
-            .map(|keys| {
-                keys.contains(evdev::KeyCode::KEY_A) || keys.contains(evdev::KeyCode::KEY_F1)
-            })
-            .unwrap_or(false);
-
-        // Skip devices with mouse motion (REL_X/REL_Y) - these would cause sensitivity issues
-        // when passed through a virtual device due to libinput's DPI handling
-        let has_mouse_motion = device
-            .supported_relative_axes()
-            .map(|axes| axes.contains(RelativeAxisCode::REL_X))
-            .unwrap_or(false);
-
-        if has_keyboard && !has_mouse_motion {
+        if is_event_node && should_grab_device(&path, wanted) {
             devices.push(path);
         }
     }
@@ -577,105 +925,168 @@ async fn find_keyboard_devices() -> Result<Vec<PathBuf>> {
     Ok(devices)
 }
 
-/// Grab a device for exclusive access
-async fn grab_device(path: &Path) -> Result<Device> {
-    let mut device =
-        Device::open(path).with_context(|| format!("failed to open device: {}", path.display()))?;
+/// Grab a device and spawn its reader task, recording it as held on success.
+fn grab_and_spawn(
+    path: &Path,
+    held: &mut HashSet<PathBuf>,
+    event_tx: &mpsc::UnboundedSender<DeviceMessage>,
+) {
+    let mut device = match Device::open(path) {
+        Ok(device) => device,
+        Err(e) => {
+            debug!("failed to open {}: {}", path.display(), e);
+            return;
+        }
+    };
 
-    device
-        .grab()
-        .with_context(|| format!("failed to grab device: {}", path.display()))?;
+    let name = device.name().unwrap_or("unknown").to_string();
 
-    Ok(device)
+    if let Err(e) = device.grab() {
+        // Contention is normal and often transient (another remapper, or a
+        // node that is not settled yet), so the periodic re-scan retries.
+        debug!("failed to grab {} ({}): {}", name, path.display(), e);
+        return;
+    }
+
+    info!("grabbed device: {} ({})", name, path.display());
+    held.insert(path.to_path_buf());
+
+    let path = path.to_path_buf();
+    let tx = event_tx.clone();
+    tokio::spawn(async move {
+        if let Err(e) = process_device_events(device, path.clone(), &tx).await {
+            debug!("device {} stopped: {}", path.display(), e);
+        }
+        let _ = tx.send(DeviceMessage::Gone(path));
+    });
+}
+
+/// Watch `/dev/input` for devices appearing or becoming accessible.
+///
+/// IN_ATTRIB matters as much as IN_CREATE: udev sets permissions after create.
+fn spawn_device_watcher(hotplug_tx: mpsc::UnboundedSender<PathBuf>) {
+    use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
+
+    let spawned = std::thread::Builder::new()
+        .name("rebinded-hotplug".to_string())
+        .spawn(move || {
+            let inotify = match Inotify::init(InitFlags::empty()) {
+                Ok(inotify) => inotify,
+                Err(e) => {
+                    warn!(
+                        "failed to init inotify ({}); relying on periodic re-scan",
+                        e
+                    );
+                    return;
+                }
+            };
+
+            if let Err(e) = inotify.add_watch(
+                "/dev/input",
+                AddWatchFlags::IN_CREATE | AddWatchFlags::IN_ATTRIB,
+            ) {
+                warn!(
+                    "failed to watch /dev/input ({}); relying on periodic re-scan",
+                    e
+                );
+                return;
+            }
+
+            debug!("watching /dev/input for hotplug events");
+
+            loop {
+                let events = match inotify.read_events() {
+                    Ok(events) => events,
+                    Err(e) => {
+                        warn!("inotify read failed: {}; hotplug detection stopped", e);
+                        return;
+                    }
+                };
+
+                for event in events {
+                    let Some(name) = event.name else { continue };
+                    let Some(name) = name.to_str() else { continue };
+                    if !name.starts_with("event") {
+                        continue;
+                    }
+
+                    let path = PathBuf::from("/dev/input").join(name);
+                    trace!("hotplug event for {}", path.display());
+                    if hotplug_tx.send(path).is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+
+    if let Err(e) = spawned {
+        warn!(
+            "failed to spawn hotplug watcher: {}; relying on periodic re-scan",
+            e
+        );
+    }
 }
 
 /// Process events from a single device
 async fn process_device_events(
     device: Device,
     device_path: PathBuf,
-    event_tx: mpsc::UnboundedSender<(evdev::InputEvent, PathBuf)>,
+    event_tx: &mpsc::UnboundedSender<DeviceMessage>,
 ) -> Result<()> {
     let mut stream = device.into_event_stream()?;
 
     loop {
-        match stream.next_event().await {
-            Ok(event) => {
-                if event_tx.send((event, device_path.clone())).is_err() {
-                    // Channel closed, exit
-                    break;
-                }
-            }
-            Err(e) => {
-                return Err(e.into());
-            }
+        let event = stream.next_event().await?;
+        if event_tx
+            .send(DeviceMessage::Event(event, device_path.clone()))
+            .is_err()
+        {
+            return Ok(());
         }
     }
-
-    Ok(())
 }
 
 /// Convert evdev InputEvent to our InputEvent type
 fn convert_event(ev: &evdev::InputEvent) -> Option<InputEvent> {
     match ev.event_type() {
         EventType::KEY => {
-            let key_code = KeyCode::new(ev.code() as u32);
             // value: 1 = press, 0 = release, 2 = auto-repeat
-            // We only care about press (1) and release (0), ignore auto-repeat
-            let down = ev.value() == 1;
-
-            // Filter out auto-repeat events
             if ev.value() == 2 {
                 return None;
             }
-
-            Some(InputEvent::Key(KeyEvent::new(key_code, down)))
+            Some(InputEvent::Key(KeyEvent::new(
+                KeyCode::new(ev.code() as u32),
+                ev.value() == 1,
+            )))
         }
         EventType::RELATIVE => {
-            // REL_WHEEL: value > 0 = up (away from user), value < 0 = down (toward user)
+            // REL_WHEEL: value > 0 = up (away from user), value < 0 = down
             if ev.code() == RelativeAxisCode::REL_WHEEL.0 {
-                let up = ev.value() > 0;
-                trace!(
-                    "scroll event captured: {} (value={})",
-                    if up { "up" } else { "down" },
-                    ev.value()
-                );
-                Some(InputEvent::Scroll { up })
+                Some(InputEvent::Scroll { up: ev.value() > 0 })
             } else {
-                None // Ignore other relative axes (mouse movement, etc.)
+                None
             }
         }
-        _ => None, // Ignore all other event types
+        _ => None,
     }
 }
 
-// ============================================================================
-// Virtual Device (uinput)
-// ============================================================================
-
 /// Create a virtual keyboard for re-injecting events
 ///
-/// Note: We intentionally DON'T include mouse axes (REL_X/REL_Y) because libinput
-/// applies different DPI handling to virtual devices, causing sensitivity issues.
-/// Mouse events go directly through the physical device (not grabbed).
-/// Scroll wheel is intercepted via XInput2 at the X11 level instead.
-async fn create_virtual_keyboard() -> Result<VirtualDevice> {
+/// Keys only: relative axes make udev tag the device a mouse, which splits it
+/// into a pointer plus keyboard subdevice under libinput. Scroll passthrough
+/// replays the X11 grab rather than re-injecting.
+fn create_virtual_keyboard() -> Result<VirtualDevice> {
     use evdev::AttributeSet;
 
-    // Create key set with all standard keys (including mouse buttons)
     let mut keys = AttributeSet::<evdev::KeyCode>::new();
     for code in 0..=767u16 {
         keys.insert(evdev::KeyCode::new(code));
     }
 
-    // Only include scroll wheel axes for re-injection (no mouse motion)
-    let mut relative_axes = AttributeSet::<RelativeAxisCode>::new();
-    relative_axes.insert(RelativeAxisCode::REL_WHEEL); // Scroll wheel
-    relative_axes.insert(RelativeAxisCode::REL_HWHEEL); // Horizontal scroll
-
     let device = VirtualDevice::builder()?
-        .name("rebinded-virtual-keyboard")
+        .name(VIRTUAL_KEYBOARD_NAME)
         .with_keys(&keys)?
-        .with_relative_axes(&relative_axes)?
         .build()?;
 
     Ok(device)
@@ -683,11 +1094,7 @@ async fn create_virtual_keyboard() -> Result<VirtualDevice> {
 
 /// Create a SYN_REPORT synchronization event
 fn create_syn_report() -> evdev::InputEvent {
-    evdev::InputEvent::new(
-        evdev::EventType::SYNCHRONIZATION.0,
-        0, // SYN_REPORT code
-        0,
-    )
+    evdev::InputEvent::new(evdev::EventType::SYNCHRONIZATION.0, 0, 0)
 }
 
 /// Create a key combo as evdev InputEvents with proper synchronization
@@ -703,9 +1110,7 @@ fn create_key_combo(keys: &[(evdev::KeyCode, bool)]) -> Vec<evdev::InputEvent> {
 
 /// Send volume command via pactl (PulseAudio/PipeWire)
 ///
-/// Uses `pactl` command to directly control system volume.
-/// This is more reliable than emitting XF86Audio keys, which may not be
-/// recognized by all desktop environments or audio systems.
+/// More reliable than XF86Audio keys, which not every desktop picks up.
 async fn send_volume_command(cmd: MediaCommand) {
     let pactl_arg = match cmd {
         MediaCommand::VolumeUp => "+2%",
@@ -719,7 +1124,6 @@ async fn send_volume_command(cmd: MediaCommand) {
         _ => "set-sink-volume",
     };
 
-    // Spawn pactl command
     let result = tokio::process::Command::new("pactl")
         .arg(pactl_cmd)
         .arg("@DEFAULT_SINK@")
@@ -744,163 +1148,12 @@ async fn send_volume_command(cmd: MediaCommand) {
     }
 }
 
-// ============================================================================
-// X11 Window Queries
-// ============================================================================
-
-/// Get window information via X11
-fn get_x11_window_info(x11_conn: Option<&StdArc<Mutex<X11Connection>>>) -> Result<WindowInfo> {
-    use x11rb::connection::Connection;
-    use x11rb::protocol::xproto::ConnectionExt as _;
-
-    // Get or create X11 connection
-    let conn_arc = match x11_conn {
-        Some(c) => StdArc::clone(c),
-        None => {
-            // Lazy initialization - will fail if X11 not available
-            let (conn, screen_num) = x11rb::connect(None).context("failed to connect to X11")?;
-            StdArc::new(Mutex::new(X11Connection { conn, screen_num }))
-        }
-    };
-
-    // Block on the async lock (we're in a sync context from Platform::get_active_window)
-    let guard = match conn_arc.try_lock() {
-        Ok(g) => g,
-        Err(_) => {
-            // If we can't get the lock immediately, return empty rather than blocking
-            return Ok(WindowInfo::default());
-        }
-    };
-
-    let conn = &guard.conn;
-    let root = conn.setup().roots[guard.screen_num].root;
-
-    // Get active window atom
-    let net_active_window = intern_atom_cached(conn, "_NET_ACTIVE_WINDOW")?;
-    let window_atom = intern_atom_cached(conn, "WINDOW")?;
-
-    // Query active window ID
-    let reply = conn
-        .get_property(false, root, net_active_window, window_atom, 0, 1)?
-        .reply()?;
-
-    if reply.value.len() < 4 {
-        return Ok(WindowInfo::default());
-    }
-
-    let active_window = u32::from_ne_bytes([
-        reply.value[0],
-        reply.value[1],
-        reply.value[2],
-        reply.value[3],
-    ]);
-
-    // Query window properties
-    Ok(WindowInfo {
-        title: get_x11_window_title(conn, active_window).unwrap_or_default(),
-        class: get_x11_window_class(conn, active_window).unwrap_or_default(),
-        binary: get_x11_window_binary(conn, active_window).unwrap_or_default(),
-    })
+/// Get the shared session bus connection, establishing it on first use.
+async fn session_bus(cell: &OnceCell<zbus::Connection>) -> Result<&zbus::Connection> {
+    cell.get_or_try_init(|| async { zbus::Connection::session().await })
+        .await
+        .context("failed to connect to the session bus")
 }
-
-/// Intern an X11 atom (with caching)
-fn intern_atom_cached(conn: &x11rb::rust_connection::RustConnection, name: &str) -> Result<u32> {
-    use x11rb::protocol::xproto::ConnectionExt as _;
-
-    let reply = conn.intern_atom(false, name.as_bytes())?.reply()?;
-    Ok(reply.atom)
-}
-
-/// Get window title
-fn get_x11_window_title(
-    conn: &x11rb::rust_connection::RustConnection,
-    window: u32,
-) -> Result<String> {
-    use x11rb::protocol::xproto::ConnectionExt as _;
-    use x11rb::protocol::xproto::*;
-
-    // Try _NET_WM_NAME (UTF-8) first
-    let net_wm_name = intern_atom_cached(conn, "_NET_WM_NAME")?;
-    let utf8_string = intern_atom_cached(conn, "UTF8_STRING")?;
-
-    let reply = conn
-        .get_property(false, window, net_wm_name, utf8_string, 0, 1024)?
-        .reply()?;
-
-    if !reply.value.is_empty()
-        && let Ok(s) = String::from_utf8(reply.value)
-    {
-        return Ok(s);
-    }
-
-    // Fallback to WM_NAME
-    let wm_name: u32 = AtomEnum::WM_NAME.into();
-    let string_atom: u32 = AtomEnum::STRING.into();
-
-    let reply = conn
-        .get_property(false, window, wm_name, string_atom, 0, 1024)?
-        .reply()?;
-
-    Ok(String::from_utf8_lossy(&reply.value).into_owned())
-}
-
-/// Get window class (second element of WM_CLASS)
-fn get_x11_window_class(
-    conn: &x11rb::rust_connection::RustConnection,
-    window: u32,
-) -> Result<String> {
-    use x11rb::protocol::xproto::ConnectionExt as _;
-    use x11rb::protocol::xproto::*;
-
-    let wm_class: u32 = AtomEnum::WM_CLASS.into();
-    let string_atom: u32 = AtomEnum::STRING.into();
-
-    let reply = conn
-        .get_property(false, window, wm_class, string_atom, 0, 1024)?
-        .reply()?;
-
-    // WM_CLASS format: "instance\0class\0"
-    let s = String::from_utf8_lossy(&reply.value);
-    Ok(s.split('\0').nth(1).unwrap_or("").to_string())
-}
-
-/// Get window binary name via PID
-fn get_x11_window_binary(
-    conn: &x11rb::rust_connection::RustConnection,
-    window: u32,
-) -> Result<String> {
-    use x11rb::protocol::xproto::ConnectionExt as _;
-
-    // Get _NET_WM_PID
-    let net_wm_pid = intern_atom_cached(conn, "_NET_WM_PID")?;
-    let cardinal = intern_atom_cached(conn, "CARDINAL")?;
-
-    let reply = conn
-        .get_property(false, window, net_wm_pid, cardinal, 0, 1)?
-        .reply()?;
-
-    if reply.value.len() < 4 {
-        return Ok(String::new());
-    }
-
-    let pid = u32::from_ne_bytes([
-        reply.value[0],
-        reply.value[1],
-        reply.value[2],
-        reply.value[3],
-    ]);
-
-    // Read /proc/<pid>/exe symlink
-    let exe_path = std::fs::read_link(format!("/proc/{}/exe", pid))?;
-    Ok(exe_path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default())
-}
-
-// ============================================================================
-// D-Bus / MPRIS Media Control
-// ============================================================================
 
 /// Information about an MPRIS media player
 #[derive(Debug)]
@@ -928,7 +1181,6 @@ impl MprisPlayerInfo {
             .service_name
             .strip_prefix(PREFIX)
             .unwrap_or(&self.service_name);
-        // Handle instance suffixes like "firefox.instance_1234"
         name.split('.').next().unwrap_or(name)
     }
 
@@ -938,7 +1190,6 @@ impl MprisPlayerInfo {
         let player_name = self.player_name().to_lowercase();
         let identity = self.identity.to_lowercase();
 
-        // Extract just the binary name from full path (e.g., "/usr/bin/firefox" -> "firefox")
         let binary_name = window
             .binary
             .rsplit('/')
@@ -947,25 +1198,22 @@ impl MprisPlayerInfo {
             .to_lowercase();
         let class = window.class.to_lowercase();
 
-        // Helper to check bidirectional contains (only if both strings are non-empty)
         let matches = |a: &str, b: &str| -> bool {
             !a.is_empty() && !b.is_empty() && (a.contains(b) || b.contains(a))
         };
 
-        // Check various matching strategies
         matches(&binary_name, &player_name)
             || matches(&class, &player_name)
             || matches(&binary_name, &identity)
             || matches(&class, &identity)
     }
 
-    /// Check if this player's process family matches the window
-    /// More lenient than matches_window - checks if they share a common base
-    /// e.g., "vivaldi" matches "vivaldi-bin", "chromium" matches "chromium-browser"
+    /// Check if this player shares a process family with the window
+    ///
+    /// Looser than `matches_window`: "vivaldi" matches "vivaldi-bin".
     fn matches_process_family(&self, window: &WindowInfo) -> bool {
         let player_name = self.player_name().to_lowercase();
 
-        // Extract binary base name
         let binary_name = window
             .binary
             .rsplit('/')
@@ -973,12 +1221,10 @@ impl MprisPlayerInfo {
             .unwrap_or(&window.binary)
             .to_lowercase();
 
-        // Bail early if binary is empty - can't match process family without it
         if binary_name.is_empty() {
             return false;
         }
 
-        // Strip common suffixes for comparison
         let binary_base = binary_name
             .strip_suffix("-bin")
             .or_else(|| binary_name.strip_suffix("-browser"))
@@ -991,7 +1237,6 @@ impl MprisPlayerInfo {
             .or_else(|| player_name.strip_suffix("-stable"))
             .unwrap_or(&player_name);
 
-        // Check if bases match or one contains the other
         binary_base == player_base
             || binary_base.starts_with(player_base)
             || player_base.starts_with(binary_base)
@@ -1000,9 +1245,8 @@ impl MprisPlayerInfo {
 
 /// Tracks historical state for MPRIS player selection
 ///
-/// This enables smarter player selection by remembering which players were
-/// recently focused or playing, allowing media commands to target the "right"
-/// player even when focused on an unrelated window.
+/// Remembering recent focus and playback lets media keys reach the intended
+/// player even when an unrelated window is focused.
 #[derive(Debug, Default)]
 struct MprisPlayerTracker {
     /// Player name -> last time window was focused (e.g., "spotify" -> Instant)
@@ -1065,14 +1309,13 @@ impl MprisPlayerTracker {
 
     /// Find which player (if any) matches the given window
     fn find_matching_player(&self, window: &WindowInfo) -> Option<&str> {
-        // Create temporary MprisPlayerInfo to use existing matching logic
         for player_name in &self.known_players {
-            let temp_info = MprisPlayerInfo {
+            let candidate = MprisPlayerInfo {
                 service_name: format!("org.mpris.MediaPlayer2.{}", player_name),
                 identity: player_name.clone(),
                 playback_status: String::new(),
             };
-            if temp_info.matches_window(window) || temp_info.matches_process_family(window) {
+            if candidate.matches_window(window) || candidate.matches_process_family(window) {
                 return Some(player_name);
             }
         }
@@ -1080,97 +1323,77 @@ impl MprisPlayerTracker {
     }
 }
 
-/// Background task that monitors window focus to track MPRIS player activity
+/// Records which media player windows get focused, for player selection.
 ///
-/// Polls the active window every 500ms and records focus events for windows
-/// that match known MPRIS players. Also periodically refreshes the list of
-/// known players from D-Bus.
+/// Driven by focus updates rather than a timer, so an idle desktop costs nothing.
 async fn mpris_focus_monitor(
-    x11_conn: Option<StdArc<Mutex<X11Connection>>>,
+    mut window_rx: watch::Receiver<WindowInfo>,
     tracker: StdArc<Mutex<MprisPlayerTracker>>,
+    dbus_cell: StdArc<OnceCell<zbus::Connection>>,
 ) {
-    const POLL_INTERVAL: Duration = Duration::from_millis(500);
-
-    // Create our own D-Bus connection for querying MPRIS players
-    let dbus_conn = match zbus::Connection::session().await {
-        Ok(conn) => conn,
-        Err(e) => {
-            warn!("focus monitor: failed to connect to D-Bus: {}", e);
-            return;
-        }
-    };
-
     let mut last_focused_player: Option<String> = None;
 
-    loop {
-        tokio::time::sleep(POLL_INTERVAL).await;
+    while window_rx.changed().await.is_ok() {
+        let window_info = window_rx.borrow_and_update().clone();
+        if window_info.binary.is_empty() && window_info.class.is_empty() {
+            last_focused_player = None;
+            continue;
+        }
 
-        // Get current active window
-        let window_info = match get_x11_window_info(x11_conn.as_ref()) {
-            Ok(info) if !info.binary.is_empty() || !info.class.is_empty() => info,
-            _ => continue, // Skip if we can't get window info
+        let Ok(conn) = session_bus(&dbus_cell).await else {
+            continue;
         };
 
-        let mut tracker_guard = tracker.lock().await;
-
-        // Refresh known players list if needed
-        if tracker_guard.needs_player_refresh()
-            && let Some(players) = list_mpris_players(&dbus_conn).await
-        {
-            // Extract player names from service names
-            let player_names: Vec<String> = players
+        // Refresh the player list outside the tracker lock so a slow bus call
+        // cannot stall a media keypress waiting on the same lock.
+        let refresh_needed = tracker.lock().await.needs_player_refresh();
+        if refresh_needed && let Some(services) = list_mpris_players(conn).await {
+            let names = services
                 .iter()
-                .filter_map(|s| {
-                    s.strip_prefix("org.mpris.MediaPlayer2.")
+                .filter_map(|service| {
+                    service
+                        .strip_prefix("org.mpris.MediaPlayer2.")
                         .map(|name| name.split('.').next().unwrap_or(name).to_string())
                 })
                 .collect();
-            tracker_guard.update_known_players(player_names);
+            tracker.lock().await.update_known_players(names);
         }
 
-        // Check if current window matches any known player
-        if let Some(player_name) = tracker_guard.find_matching_player(&window_info) {
-            let player_name = player_name.to_string();
-
-            // Only record if this is a new focus (avoid spamming updates)
-            if last_focused_player.as_ref() != Some(&player_name) {
-                debug!(
-                    "focus changed to player: {} (window: {})",
-                    player_name, window_info.class
-                );
-                tracker_guard.record_focus(&player_name);
-                drop(tracker_guard); // Release lock before updating last_focused_player
-                last_focused_player = Some(player_name);
+        let mut guard = tracker.lock().await;
+        match guard.find_matching_player(&window_info) {
+            Some(player_name) => {
+                let player_name = player_name.to_string();
+                if last_focused_player.as_ref() != Some(&player_name) {
+                    debug!(
+                        "focus changed to player: {} (window: {})",
+                        player_name, window_info.class
+                    );
+                    guard.record_focus(&player_name);
+                    last_focused_player = Some(player_name);
+                }
             }
-        } else {
-            last_focused_player = None;
+            None => last_focused_player = None,
         }
     }
 }
 
 /// Send MPRIS media command with smart player selection
 async fn send_mpris_command(
-    dbus_conn: Option<StdArc<zbus::Connection>>,
+    dbus_cell: &OnceCell<zbus::Connection>,
     cmd: MediaCommand,
     window_info: &WindowInfo,
     tracker: StdArc<Mutex<MprisPlayerTracker>>,
 ) -> Result<()> {
     use zbus::proxy;
 
-    // Get or create D-Bus connection
-    let conn = match dbus_conn {
-        Some(c) => c,
-        None => StdArc::new(zbus::Connection::session().await?),
-    };
+    let conn = session_bus(dbus_cell).await?;
 
-    // Find the best MPRIS player based on playback state and window focus
-    let player_name = find_best_mpris_player(&conn, window_info, &tracker)
+    let player_name = find_best_mpris_player(conn, window_info, &tracker)
         .await
         .context("no MPRIS media players found")?;
 
     debug!("sending MPRIS command {:?} to {}", cmd, player_name);
 
-    // Define MPRIS Player interface
     #[proxy(
         interface = "org.mpris.MediaPlayer2.Player",
         default_service = "org.mpris.MediaPlayer2",
@@ -1183,13 +1406,11 @@ async fn send_mpris_command(
         async fn stop(&self) -> zbus::Result<()>;
     }
 
-    // Create proxy for the player
-    let proxy = MediaPlayer2PlayerProxy::builder(&conn)
+    let proxy = MediaPlayer2PlayerProxy::builder(conn)
         .destination(player_name)?
         .build()
         .await?;
 
-    // Call appropriate method
     match cmd {
         MediaCommand::PlayPause => proxy.play_pause().await?,
         MediaCommand::Next => proxy.next().await?,
@@ -1213,14 +1434,8 @@ async fn find_best_mpris_player(
     window_info: &WindowInfo,
     tracker: &StdArc<Mutex<MprisPlayerTracker>>,
 ) -> Option<String> {
-    // Get all MPRIS player service names
     let player_services = list_mpris_players(conn).await?;
 
-    if player_services.is_empty() {
-        return None;
-    }
-
-    // Get detailed info for each player
     let mut players: Vec<MprisPlayerInfo> = Vec::new();
     for service in player_services {
         if let Some(info) = get_mpris_player_info(conn, &service).await {
@@ -1232,18 +1447,12 @@ async fn find_best_mpris_player(
         return None;
     }
 
-    // Update tracker with currently playing players
-    {
-        let mut tracker_guard = tracker.lock().await;
-        for player in &players {
-            if player.is_playing() {
-                tracker_guard.record_playing(player.player_name());
-            }
+    let mut guard = tracker.lock().await;
+    for player in &players {
+        if player.is_playing() {
+            guard.record_playing(player.player_name());
         }
     }
-
-    // Get tracker state for selection (read-only from here)
-    let tracker_guard = tracker.lock().await;
 
     debug!(
         "found {} MPRIS players, focused window: binary={:?} class={:?}",
@@ -1252,7 +1461,6 @@ async fn find_best_mpris_player(
         window_info.class
     );
 
-    // Log each player's selection factors
     for player in &players {
         let player_name = player.player_name();
         debug!(
@@ -1262,21 +1470,11 @@ async fn find_best_mpris_player(
             player.is_playing(),
             player.matches_window(window_info),
             player.matches_process_family(window_info),
-            tracker_guard
-                .get_valid_focus(player_name)
-                .map(|t| t.elapsed()),
-            tracker_guard
-                .get_last_playing(player_name)
-                .map(|t| t.elapsed()),
+            guard.get_valid_focus(player_name).map(|t| t.elapsed()),
+            guard.get_last_playing(player_name).map(|t| t.elapsed()),
         );
     }
 
-    // Select the best player using comparison-based priority:
-    // 1. Currently playing (highest)
-    // 2. Matches focused window (current)
-    // 3. Same process family as focused window
-    // 4. Last focused within 10 min (more recent wins)
-    // 5. Last playing (more recent wins)
     let best_player = players.iter().max_by(|a, b| {
         let a_name = a.player_name();
         let b_name = b.player_name();
@@ -1292,22 +1490,20 @@ async fn find_best_mpris_player(
                     .cmp(&b.matches_process_family(window_info))
             })
             .then_with(|| {
-                // Last focused within 10 min - more recent wins (larger Instant = more recent)
-                tracker_guard
+                guard
                     .get_valid_focus(a_name)
-                    .cmp(&tracker_guard.get_valid_focus(b_name))
+                    .cmp(&guard.get_valid_focus(b_name))
             })
             .then_with(|| {
-                // Last playing - more recent wins (larger Instant = more recent)
-                tracker_guard
+                guard
                     .get_last_playing(a_name)
-                    .cmp(&tracker_guard.get_last_playing(b_name))
+                    .cmp(&guard.get_last_playing(b_name))
             })
     });
 
-    best_player.map(|p| {
-        debug!("selected player: {}", p.service_name);
-        p.service_name.clone()
+    best_player.map(|player| {
+        debug!("selected player: {}", player.service_name);
+        player.service_name.clone()
     })
 }
 
@@ -1355,20 +1551,18 @@ async fn get_mpris_player_info(conn: &zbus::Connection, service: &str) -> Option
         .await
         .ok()?;
 
-    // Get Identity from org.mpris.MediaPlayer2 interface
     let identity = proxy
         .get("org.mpris.MediaPlayer2", "Identity")
         .await
         .ok()
-        .and_then(|v| String::try_from(v).ok())
+        .and_then(|value| String::try_from(value).ok())
         .unwrap_or_default();
 
-    // Get PlaybackStatus from org.mpris.MediaPlayer2.Player interface
     let playback_status = proxy
         .get("org.mpris.MediaPlayer2.Player", "PlaybackStatus")
         .await
         .ok()
-        .and_then(|v| String::try_from(v).ok())
+        .and_then(|value| String::try_from(value).ok())
         .unwrap_or_else(|| "Stopped".to_string());
 
     Some(MprisPlayerInfo {
@@ -1378,26 +1572,19 @@ async fn get_mpris_player_info(conn: &zbus::Connection, service: &str) -> Option
     })
 }
 
-// ============================================================================
-// Error Handling & Utilities
-// ============================================================================
-
 /// Check system permissions and requirements
 fn check_permissions() -> Result<()> {
-    // Check /dev/input exists
     if !Path::new("/dev/input").exists() {
         return Err(anyhow!("/dev/input not found. Are you running on Linux?"));
     }
 
-    // Check if we can read at least one input device
     let readable = std::fs::read_dir("/dev/input")?
-        .filter_map(|e| e.ok())
-        .any(|e| {
-            let path = e.path();
+        .filter_map(|entry| entry.ok())
+        .any(|entry| {
+            let path = entry.path();
             path.file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.starts_with("event"))
-                .unwrap_or(false)
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("event"))
                 && std::fs::File::open(&path).is_ok()
         });
 
@@ -1410,7 +1597,6 @@ fn check_permissions() -> Result<()> {
         ));
     }
 
-    // Check uinput exists
     if !Path::new("/dev/uinput").exists() {
         return Err(anyhow!(
             "/dev/uinput not found. Load the uinput module:\n  \
@@ -1420,7 +1606,6 @@ fn check_permissions() -> Result<()> {
         ));
     }
 
-    // Check if we can write to uinput
     if OpenOptions::new().write(true).open("/dev/uinput").is_err() {
         return Err(anyhow!(
             "Cannot write to /dev/uinput.\n\
@@ -1439,11 +1624,8 @@ fn check_permissions() -> Result<()> {
 fn setup_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
-        // Try to ungrab all devices
         warn!("panic detected, attempting to ungrab devices");
         let _ = ungrab_all_devices();
-
-        // Call original panic hook
         default_hook(panic_info);
     }));
 }
@@ -1452,7 +1634,7 @@ fn setup_panic_hook() {
 fn ungrab_all_devices() -> Result<()> {
     for entry in std::fs::read_dir("/dev/input")? {
         let path = entry?.path();
-        if let Some(filename) = path.file_name().and_then(|n| n.to_str())
+        if let Some(filename) = path.file_name().and_then(|name| name.to_str())
             && filename.starts_with("event")
             && let Ok(mut device) = Device::open(&path)
         {
@@ -1461,17 +1643,3 @@ fn ungrab_all_devices() -> Result<()> {
     }
     Ok(())
 }
-
-/// Macro for warning only once
-macro_rules! warn_once {
-    ($($arg:tt)*) => {{
-        use std::sync::Once;
-        static WARNED: Once = Once::new();
-        WARNED.call_once(|| {
-            warn!($($arg)*);
-        });
-    }};
-}
-
-// Export the macro for use in this module
-use warn_once;

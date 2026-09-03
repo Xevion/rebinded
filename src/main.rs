@@ -71,11 +71,15 @@ async fn main() -> ExitCode {
 
     // Create platform and run event loop
     let mut platform = Platform::new();
+    let bound_keys = runtime_config.bindings.keys().copied().collect();
 
     if let Err(err) = platform
-        .run(|event: InputEvent, platform_handle: PlatformHandle| {
-            handle_event(event, platform_handle, &runtime_config)
-        })
+        .run(
+            &bound_keys,
+            |event: InputEvent, platform_handle: PlatformHandle| {
+                handle_event(event, platform_handle, &runtime_config)
+            },
+        )
         .await
     {
         eprintln!("error: {err:?}");
@@ -129,10 +133,10 @@ async fn handle_event(
         }
     };
 
-    // TODO: Fast-path optimization - check static BOUND_KEYS set before crossing
-    // async boundary to avoid channel overhead for unbound keys (~99% of key presses)
+    // TODO: check a static BOUND_KEYS set before crossing the async boundary,
+    // avoiding channel overhead for unbound keys (~99% of key presses)
 
-    // Check if this key has a binding - if not, pass through
+    // Unbound keys pass through
     let Some(binding) = config.bindings.get(&key_event.key) else {
         return EventResponse::Passthrough;
     };

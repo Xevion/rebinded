@@ -27,10 +27,8 @@ use tracing::warn;
 
 /// Parsed configuration before validation
 ///
-/// Contains raw parsed data with source spans preserved for error reporting.
-/// Uses HashMap with Spanned keys - the Spanned type implements Hash/Eq based
-/// on value only (ignoring span), so lookups work correctly while preserving
-/// span information for error reporting.
+/// Keys are `Spanned`, which hashes on value alone, so lookups work while the
+/// span stays available for error reporting.
 #[derive(Debug)]
 pub struct Config {
     /// Strategy definitions keyed by name
@@ -130,9 +128,8 @@ impl ConfigLoader {
 
     /// Parse content and build runtime config
     async fn parse_and_build(&mut self) -> Result<(Config, RuntimeConfig), ConfigError> {
-        // Parse into spanned table for location tracking
-        // Clone content for parsing - DeTable<'a> has a lifetime tied to the source,
-        // but we need to mutably borrow self during parse_table
+        // DeTable borrows the source for its lifetime, but parse_table needs a
+        // mutable borrow of self, so the content is cloned
         let content_for_parse = self.source_content.clone();
         let table = DeTable::parse(&content_for_parse)
             .map_err(|e| ConfigError::parse(&self.source_name, self.source_content.clone(), e))?;
@@ -168,7 +165,7 @@ impl ConfigLoader {
                     bindings = self.parse_bindings(value);
                 }
                 _ => {
-                    // Unknown top-level key - could add a warning here
+                    // Unknown top-level key; a warning could go here
                 }
             }
         }

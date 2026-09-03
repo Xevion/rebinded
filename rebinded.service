@@ -1,17 +1,28 @@
 [Unit]
 Description=Rebinded key remapping daemon
-After=graphical-session.target
 Documentation=https://github.com/xevion/rebinded
-StartLimitIntervalSec=90
-StartLimitBurst=3
+
+# graphical-session.target is reached only after the session manager has pushed
+# DISPLAY and XAUTHORITY into the user manager's environment. Starting any
+# earlier hands the daemon an environment with no display, permanently
+# disabling window conditions and scroll bindings for the life of the process.
+# Both the ordering and the Install target are required: After= alone is inert
+# unless the target is pulled into the same start transaction.
+After=graphical-session.target
+PartOf=graphical-session.target
+
+# An input daemon that gives up leaves the user with no remapping and no
+# signal. RestartSec alone bounds the retry rate; rate limiting would only
+# convert a transient device or display fault into a permanent outage.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/rebinded
 Restart=always
-RestartSec=10
+RestartSec=3
 StandardOutput=journal
 StandardError=journal
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target
