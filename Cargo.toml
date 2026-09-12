@@ -41,7 +41,7 @@ x11rb = { version = "0.13", features = ["allow-unsafe-code", "xinput"] }
 zbus = "5"
 
 [dev-dependencies]
-assert2 = "0.3"
+assert2 = "0.4"
 
 [profile.release]
 lto = true
