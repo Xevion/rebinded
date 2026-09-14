@@ -1,0 +1,18 @@
+# Restore pointer DPI for the mirrors rebinded creates.
+#
+# Claiming a wheel means claiming the pointer it belongs to, so rebinded
+# replays that pointer through a uinput mirror. 70-mouse.rules builds its hwdb
+# key as "mouse:$env{ID_BUS}:v...p...:name:...", and ID_BUS is derived from the
+# USB parent device. A uinput device has no USB parent, so the key comes out as
+# "mouse::v..." instead of "mouse:usb:v...", never matches, and the mouse ends
+# up with no MOUSE_DPI. libinput then accelerates against a default 1000 DPI
+# rather than the real one, which is felt directly as the wrong sensitivity.
+#
+# Running the same lookup with the bus spelled out gives the mirror the DPI its
+# source would have been given. The match is limited to virtual input devices
+# that report a USB bustype, which is what a mirror of a USB pointer looks like.
+
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", \
+  DEVPATH=="*/virtual/input/*", ATTRS{id/bustype}=="0003", \
+  ENV{ID_INPUT_MOUSE}=="1", \
+  IMPORT{builtin}="hwdb 'mouse:usb:v$attr{id/vendor}p$attr{id/product}:name:$attr{name}:'"

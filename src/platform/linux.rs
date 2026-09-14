@@ -2,13 +2,17 @@
 //!
 //! Key components:
 //! - evdev for raw input device access and virtual device creation
-//! - X11 (via x11rb) for window queries and scroll wheel interception
+//! - X11 (via x11rb) for window queries
 //! - D-Bus (via zbus) for MPRIS media control
 //!
-//! One dedicated thread owns the single X11 connection and both publishes the
-//! focused window and runs the scroll grab, so the two recover together and no
-//! blocking round trip lands on the tokio runtime that processes key events.
-//! `get_active_window` reads a cached snapshot.
+//! Scroll is intercepted at the evdev layer rather than through an X11 button
+//! grab. A grab can only see the emulated button 4/5 events, while toolkits
+//! scroll from the high resolution axis those are derived from, so a grab
+//! cannot suppress a tick it has already been delivered.
+//!
+//! One dedicated thread owns the X11 connection and publishes the focused
+//! window, so no blocking round trip lands on the tokio runtime that processes
+//! input. `get_active_window` reads a cached snapshot.
 
 use super::{EventResponse, MediaCommand, PlatformInterface, SyntheticKey};
 use crate::config::WindowInfo;
@@ -33,22 +37,18 @@ const X11_RECONNECT_MAX: Duration = Duration::from_secs(30);
 /// Backstop for devices inotify missed, or that were busy when last tried.
 const DEVICE_RESCAN_INTERVAL: Duration = Duration::from_secs(30);
 
-/// How long the pointer may stay frozen deciding one scroll tick.
-///
-/// The grab freezes motion too, so exceeding this is felt as stutter.
-const POINTER_FREEZE_BUDGET: Duration = Duration::from_millis(4);
-
-/// Minimum gap between freeze warnings, so a slow run reports without flooding.
-const FREEZE_WARNING_INTERVAL: Duration = Duration::from_secs(10);
-
-/// X11 pointer names whose scroll events the grab must ignore.
-///
-/// Skipping our own device is what stops a replayed tick being recaptured.
-const SYNTHETIC_POINTER_NAMES: [&str; 4] = ["rebinded", "XTEST", "Virtual core", "ydotoold"];
-
 /// Name of the uinput device we re-inject through, and the name we refuse to
 /// grab so our own output cannot feed back in.
 const VIRTUAL_KEYBOARD_NAME: &str = "rebinded-virtual-keyboard";
+
+/// What a claimed device is held for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DeviceRole {
+    /// Claimed for its keys; only key events are re-injected.
+    Keyboard,
+    /// Claimed for its wheel; every event is mirrored except diverted ticks.
+    Pointer,
+}
 
 /// Get human-readable key name from Linux evdev code
 pub fn get_key_name(code: u32) -> String {
@@ -145,7 +145,12 @@ impl PlatformInterface for Platform {
         }
     }
 
-    async fn run<F, Fut>(&mut self, bound_keys: &HashSet<KeyCode>, mut handler: F) -> Result<()>
+    async fn run<F, Fut>(
+        &mut self,
+        bound_keys: &HashSet<KeyCode>,
+        intercept_scroll: bool,
+        mut handler: F,
+    ) -> Result<()>
     where
         F: FnMut(InputEvent, PlatformHandle) -> Fut,
         Fut: Future<Output = EventResponse>,
@@ -170,18 +175,27 @@ impl PlatformInterface for Platform {
         // the select branch stays live even while no devices are held.
         let (event_tx, mut event_rx) = mpsc::unbounded_channel::<DeviceMessage>();
 
-        let mut held: HashSet<PathBuf> = HashSet::new();
-        for path in find_bindable_devices(&wanted)? {
-            grab_and_spawn(&path, &mut held, &event_tx);
+        let mut held: HashMap<PathBuf, DeviceRole> = HashMap::new();
+        let mut mirrors: HashMap<PathBuf, VirtualDevice> = HashMap::new();
+        let mut mirror_nodes: HashSet<PathBuf> = HashSet::new();
+        for (path, role) in find_bindable_devices(&wanted, intercept_scroll, &mirror_nodes)? {
+            grab_and_spawn(
+                &path,
+                role,
+                &mut held,
+                &mut mirrors,
+                &mut mirror_nodes,
+                &event_tx,
+            );
         }
 
         if held.is_empty() {
             error!(
-                "no keyboard devices could be grabbed; waiting for one to appear. \
+                "no input devices could be grabbed; waiting for one to appear. \
                  If another remapper holds them, stop it and rebinded will pick them up."
             );
         } else {
-            info!("grabbed {} keyboard device(s)", held.len());
+            info!("grabbed {} device(s)", held.len());
         }
 
         let uinput = create_virtual_keyboard()?;
@@ -192,16 +206,9 @@ impl PlatformInterface for Platform {
         let (hotplug_tx, mut hotplug_rx) = mpsc::unbounded_channel::<PathBuf>();
         spawn_device_watcher(hotplug_tx);
 
-        // X11 thread: publishes window info and drives the scroll grab.
-        let (scroll_tx, mut scroll_rx) = mpsc::unbounded_channel::<bool>();
-        let (replay_tx, replay_rx) = crossbeam_channel::unbounded::<bool>();
+        // X11 thread: publishes window info for window conditions.
         let (window_tx, window_rx) = watch::channel(WindowInfo::default());
-        spawn_x11_thread(
-            StdArc::clone(&self.window_state),
-            scroll_tx,
-            replay_rx,
-            window_tx,
-        );
+        spawn_x11_thread(StdArc::clone(&self.window_state), window_tx);
 
         tokio::spawn(mpris_focus_monitor(
             window_rx,
@@ -214,15 +221,23 @@ impl PlatformInterface for Platform {
         rescan.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         rescan.tick().await; // the first tick resolves immediately
 
+        // Events of a claimed pointer, held until SYN_REPORT closes the frame.
+        let mut frames: HashMap<PathBuf, Vec<evdev::InputEvent>> = HashMap::new();
+        // A detent decides the micro-steps that trail it, which arrive in
+        // frames of their own once the wheel reports high resolution.
+        let mut wheel_passthrough = true;
+
         loop {
             tokio::select! {
                 Some(message) = event_rx.recv() => {
                     match message {
                         DeviceMessage::Gone(path) => {
                             held.remove(&path);
+                            mirrors.remove(&path);
+                            frames.remove(&path);
                             if held.is_empty() {
                                 warn!(
-                                    "last keyboard device released ({}); \
+                                    "last device released ({}); \
                                      waiting for a device to return",
                                     path.display()
                                 );
@@ -230,55 +245,109 @@ impl PlatformInterface for Platform {
                                 info!("released device: {}", path.display());
                             }
                         }
-                        DeviceMessage::Event(raw_event, _path) => {
-                            if raw_event.event_type() != EventType::KEY {
+                        DeviceMessage::Event(raw_event, path) => {
+                            if held.get(&path) != Some(&DeviceRole::Pointer) {
+                                if raw_event.event_type() != EventType::KEY {
+                                    continue;
+                                }
+                                let Some(input_event) = convert_event(&raw_event) else {
+                                    continue;
+                                };
+
+                                trace!(?input_event, "processing keyboard event");
+                                let response = handler(input_event, platform_handle).await;
+
+                                if response == EventResponse::Passthrough
+                                    && let Some(ref uinput) = self.uinput_device
+                                {
+                                    let mut device = uinput
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                    if let Err(e) = device.emit(&[raw_event]) {
+                                        warn!("failed to emit passthrough event: {}", e);
+                                    }
+                                }
                                 continue;
                             }
-                            let Some(input_event) = convert_event(&raw_event) else {
+
+                            // Mirroring a frame at a time keeps multi-axis
+                            // motion in one report, as the device sent it.
+                            if raw_event.event_type() != EventType::SYNCHRONIZATION {
+                                frames.entry(path).or_default().push(raw_event);
+                                continue;
+                            }
+
+                            let Some(frame) = frames.remove(&path) else {
                                 continue;
                             };
 
-                            trace!(?input_event, "processing keyboard event");
-                            let response = handler(input_event, platform_handle).await;
+                            if let Some(up) = frame.iter().find_map(detent_direction) {
+                                let input_event = InputEvent::Scroll { up };
+                                trace!(?input_event, "processing scroll event from evdev");
+                                wheel_passthrough = handler(input_event, platform_handle).await
+                                    == EventResponse::Passthrough;
+                            }
 
-                            if response == EventResponse::Passthrough
-                                && let Some(ref uinput) = self.uinput_device
-                            {
-                                let mut device = uinput
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                if let Err(e) = device.emit(&[raw_event]) {
-                                    warn!("failed to emit passthrough event: {}", e);
+                            let mut out = Vec::with_capacity(frame.len());
+                            for event in frame {
+                                if is_vertical_wheel(&event) {
+                                    if wheel_passthrough {
+                                        out.push(event);
+                                    }
+                                    continue;
                                 }
+
+                                if event.event_type() == EventType::KEY
+                                    && let Some(input_event) = convert_event(&event)
+                                    && handler(input_event, platform_handle).await
+                                        == EventResponse::Block
+                                {
+                                    continue;
+                                }
+
+                                out.push(event);
+                            }
+
+                            if !out.is_empty()
+                                && let Some(mirror) = mirrors.get_mut(&path)
+                                && let Err(e) = mirror.emit(&out)
+                            {
+                                warn!("failed to mirror pointer frame: {}", e);
                             }
                         }
                     }
                 }
 
-                // Scroll ticks arrive frozen: the X11 thread is blocked until we
-                // answer, so this branch must always reply on replay_tx.
-                Some(scroll_up) = scroll_rx.recv() => {
-                    let input_event = InputEvent::Scroll { up: scroll_up };
-                    trace!(?input_event, "processing scroll event from XInput2");
-
-                    let response = handler(input_event, platform_handle).await;
-                    let should_replay = response == EventResponse::Passthrough;
-                    if let Err(e) = replay_tx.send(should_replay) {
-                        warn!("failed to send scroll replay decision: {}", e);
-                    }
-                }
-
                 Some(path) = hotplug_rx.recv() => {
-                    if !held.contains(&path) && should_grab_device(&path, &wanted) {
-                        grab_and_spawn(&path, &mut held, &event_tx);
+                    if !held.contains_key(&path)
+                        && let Some(role) =
+                            should_grab_device(&path, &wanted, intercept_scroll, &mirror_nodes)
+                    {
+                        grab_and_spawn(
+                            &path,
+                            role,
+                            &mut held,
+                            &mut mirrors,
+                            &mut mirror_nodes,
+                            &event_tx,
+                        );
                     }
                 }
 
                 _ = rescan.tick() => {
-                    if let Ok(paths) = find_bindable_devices(&wanted) {
-                        for path in paths {
-                            if !held.contains(&path) {
-                                grab_and_spawn(&path, &mut held, &event_tx);
+                    if let Ok(found) =
+                        find_bindable_devices(&wanted, intercept_scroll, &mirror_nodes)
+                    {
+                        for (path, role) in found {
+                            if !held.contains_key(&path) {
+                                grab_and_spawn(
+                                    &path,
+                                    role,
+                                    &mut held,
+                                    &mut mirrors,
+                                    &mut mirror_nodes,
+                                    &event_tx,
+                                );
                             }
                         }
                     }
@@ -361,14 +430,14 @@ fn report_display_environment() {
     match (&x11, &wayland) {
         (Some(x11), _) => info!("X11 display {}", x11),
         (None, Some(wayland)) => warn!(
-            "running under Wayland ({}) with no DISPLAY; window conditions and \
-             scroll bindings require X11 or XWayland and will be unavailable",
+            "running under Wayland ({}) with no DISPLAY; window conditions \
+             require X11 or XWayland and will be unavailable",
             wayland
         ),
         (None, None) => warn!(
-            "DISPLAY is not set; window conditions and scroll bindings will be \
-             unavailable. Under systemd, the unit must be WantedBy=graphical-session.target \
-             so it starts after the session exports DISPLAY."
+            "DISPLAY is not set; window conditions will be unavailable. Under \
+             systemd, the unit must be WantedBy=graphical-session.target so it \
+             starts after the session exports DISPLAY."
         ),
     }
 }
@@ -410,12 +479,7 @@ impl Atoms {
 /// Spawn the thread that owns the X11 connection.
 ///
 /// Reconnects with backoff, so a display that is not up yet resolves itself.
-fn spawn_x11_thread(
-    window_state: StdArc<WindowState>,
-    scroll_tx: mpsc::UnboundedSender<bool>,
-    replay_rx: crossbeam_channel::Receiver<bool>,
-    window_tx: watch::Sender<WindowInfo>,
-) {
+fn spawn_x11_thread(window_state: StdArc<WindowState>, window_tx: watch::Sender<WindowInfo>) {
     let spawned = std::thread::Builder::new()
         .name("rebinded-x11".to_string())
         .spawn(move || {
@@ -423,7 +487,7 @@ fn spawn_x11_thread(
             let mut announced_failure = false;
 
             loop {
-                match x11_session(&window_state, &scroll_tx, &replay_rx, &window_tx) {
+                match x11_session(&window_state, &window_tx) {
                     Ok(()) => {
                         debug!("X11 thread stopping; event channel closed");
                         return;
@@ -435,8 +499,8 @@ fn spawn_x11_thread(
                             debug!("X11 session ended: {}", e);
                         } else {
                             warn!(
-                                "X11 unavailable: {}. Window conditions and scroll bindings \
-                                 are disabled until it returns; retrying in the background.",
+                                "X11 unavailable: {}. Window conditions are disabled \
+                                 until it returns; retrying in the background.",
                                 e
                             );
                             announced_failure = true;
@@ -456,8 +520,7 @@ fn spawn_x11_thread(
 
     if let Err(e) = spawned {
         error!(
-            "failed to spawn X11 thread: {}. Window conditions and scroll bindings \
-             will be unavailable.",
+            "failed to spawn X11 thread: {}. Window conditions will be unavailable.",
             e
         );
     }
@@ -466,8 +529,6 @@ fn spawn_x11_thread(
 /// One connected X11 session: set up, then serve events until the connection drops.
 fn x11_session(
     window_state: &StdArc<WindowState>,
-    scroll_tx: &mpsc::UnboundedSender<bool>,
-    replay_rx: &crossbeam_channel::Receiver<bool>,
     window_tx: &watch::Sender<WindowInfo>,
 ) -> Result<()> {
     use x11rb::connection::Connection;
@@ -486,15 +547,10 @@ fn x11_session(
     .check()
     .context("failed to select property events on root")?;
 
-    let scroll = ScrollGrab::establish(&conn, root)?;
     info!("X11 connected; window conditions active");
-    if scroll.is_some() {
-        info!("XInput2 scroll grab active; scroll wheel bindings enabled");
-    }
 
     // Publish once up front so bindings work before the first focus change.
     let mut tracked = publish_window(&conn, &atoms, root, None, window_state, window_tx);
-    let mut last_freeze_warning: Option<Instant> = None;
 
     loop {
         let event = conn.wait_for_event().context("connection lost")?;
@@ -510,50 +566,6 @@ fn x11_session(
                                 == u32::from(x11rb::protocol::xproto::AtomEnum::WM_NAME))) =>
             {
                 tracked = publish_window(&conn, &atoms, root, tracked, window_state, window_tx);
-            }
-
-            Event::XinputButtonPress(ev) => {
-                let Some(grab) = scroll.as_ref() else {
-                    continue;
-                };
-                // Root selection reports each press twice, for the slave and
-                // for the master. Only the master's copy activated the grab.
-                if ev.deviceid != grab.pointer {
-                    continue;
-                }
-
-                let Some(up) = grab.classify(&ev) else {
-                    // A source we ignore still froze the device.
-                    grab.allow(&conn, true);
-                    continue;
-                };
-
-                // The device is frozen until XIAllowEvents. If the handler is
-                // gone we must still thaw it, or the pointer stays stuck.
-                let frozen_since = Instant::now();
-                let should_replay = if scroll_tx.send(up).is_ok() {
-                    replay_rx.recv().unwrap_or(true)
-                } else {
-                    grab.allow(&conn, true);
-                    return Ok(());
-                };
-
-                grab.allow(&conn, should_replay);
-
-                let frozen = frozen_since.elapsed();
-                if frozen > POINTER_FREEZE_BUDGET
-                    && last_freeze_warning
-                        .is_none_or(|last| last.elapsed() >= FREEZE_WARNING_INTERVAL)
-                {
-                    warn!(
-                        "pointer frozen {:?} deciding one scroll tick (budget {:?}); \
-                         mouse motion stalls this long on every tick while scrolling",
-                        frozen, POINTER_FREEZE_BUDGET
-                    );
-                    last_freeze_warning = Some(Instant::now());
-                } else {
-                    trace!("scroll tick decided in {:?}", frozen);
-                }
             }
 
             _ => {}
@@ -725,196 +737,57 @@ fn window_binary(
         .unwrap_or_default())
 }
 
-/// An active XInput2 passive grab on the scroll wheel buttons.
-struct ScrollGrab {
-    /// Master pointer the grab was established on
-    pointer: u16,
-    /// Root window the grab was established on
-    root: u32,
-    /// Slave pointers whose events we accept, keyed by XInput source id
-    physical: HashSet<u16>,
-}
-
-impl ScrollGrab {
-    /// Grab scroll up/down on the master pointer.
-    ///
-    /// `Ok(None)` means no usable XInput2; window conditions still work.
-    fn establish(conn: &x11rb::rust_connection::RustConnection, root: u32) -> Result<Option<Self>> {
-        use x11rb::connection::Connection;
-        use x11rb::protocol::xinput::{self, ConnectionExt as _, EventMask};
-        use x11rb::protocol::xproto::GrabStatus;
-
-        let version = conn
-            .xinput_xi_query_version(2, 0)
-            .map_err(anyhow::Error::from)
-            .and_then(|cookie| cookie.reply().map_err(anyhow::Error::from));
-
-        let version = match version {
-            Ok(version) => version,
-            Err(e) => {
-                warn!(
-                    "XInput2 unavailable ({}); scroll wheel bindings will not work",
-                    e
-                );
-                return Ok(None);
-            }
-        };
-        debug!(
-            "XInput2 version {}.{}",
-            version.major_version, version.minor_version
-        );
-
-        let devices = conn.xinput_xi_query_device(xinput::Device::ALL)?.reply()?;
-
-        // Grab on the master pointer rather than assuming the conventional id 2.
-        let Some(pointer) = devices
-            .infos
-            .iter()
-            .find(|info| info.type_ == xinput::DeviceType::MASTER_POINTER)
-            .map(|info| info.deviceid)
-        else {
-            warn!("no master pointer found; scroll wheel bindings will not work");
-            return Ok(None);
-        };
-
-        let physical: HashSet<u16> = devices
-            .infos
-            .iter()
-            .filter(|info| info.type_ == xinput::DeviceType::SLAVE_POINTER)
-            .filter(|info| {
-                let name = String::from_utf8_lossy(&info.name);
-                !SYNTHETIC_POINTER_NAMES
-                    .iter()
-                    .any(|synthetic| name.contains(synthetic))
-            })
-            .map(|info| {
-                debug!(
-                    "accepting scroll from pointer {} (id={})",
-                    String::from_utf8_lossy(&info.name).trim_end_matches('\0'),
-                    info.deviceid
-                );
-                info.deviceid
-            })
-            .collect();
-
-        if physical.is_empty() {
-            warn!("no physical pointer devices found; scroll wheel bindings will not work");
-            return Ok(None);
-        }
-
-        let mask = xinput::XIEventMask::BUTTON_PRESS | xinput::XIEventMask::BUTTON_RELEASE;
-
-        // The server delivers nothing unless events are selected on the root
-        // before the grabs are established.
-        conn.xinput_xi_select_events(
-            root,
-            &[EventMask {
-                deviceid: xinput::Device::ALL.into(),
-                mask: vec![mask],
-            }],
-        )?
-        .check()
-        .context("failed to select XInput2 events on root")?;
-
-        for button in [4u32, 5u32] {
-            let reply = conn
-                .xinput_xi_passive_grab_device(
-                    x11rb::CURRENT_TIME,
-                    root,
-                    0, // no cursor change
-                    button,
-                    pointer,
-                    xinput::GrabType::BUTTON,
-                    // SYNC freezes the device until XIAllowEvents decides
-                    // between REPLAY_DEVICE (passthrough) and ASYNC_DEVICE (block).
-                    xinput::GrabMode22::SYNC,
-                    x11rb::protocol::xproto::GrabMode::ASYNC,
-                    xinput::GrabOwner::OWNER,
-                    &[u32::from(mask)],
-                    &[0], // any modifier
-                )?
-                .reply()?;
-
-            if let Some(status) = reply.modifiers.first()
-                && status.status != GrabStatus::SUCCESS
-            {
-                warn!("failed to grab button {}: {:?}", button, status.status);
-            }
-        }
-        conn.flush()?;
-
-        Ok(Some(Self {
-            pointer,
-            root,
-            physical,
-        }))
-    }
-
-    /// Map a button press to a scroll direction, ignoring synthetic sources.
-    fn classify(&self, ev: &x11rb::protocol::xinput::ButtonPressEvent) -> Option<bool> {
-        if !self.physical.contains(&ev.sourceid) {
-            return None;
-        }
-        match ev.detail {
-            4 => Some(true),
-            5 => Some(false),
-            _ => None,
-        }
-    }
-
-    /// Thaw the frozen device, either replaying the event or consuming it.
-    fn allow(&self, conn: &x11rb::rust_connection::RustConnection, replay: bool) {
-        use x11rb::connection::Connection;
-        use x11rb::protocol::xinput::{ConnectionExt as _, EventMode};
-
-        let mode = if replay {
-            EventMode::REPLAY_DEVICE
-        } else {
-            EventMode::ASYNC_DEVICE
-        };
-
-        if let Err(e) =
-            conn.xinput_xi_allow_events(x11rb::CURRENT_TIME, self.pointer, mode, 0, self.root)
-        {
-            warn!("failed to thaw scroll event: {}", e);
-        }
-        if let Err(e) = conn.flush() {
-            warn!("failed to flush X11 connection: {}", e);
-        }
-    }
-}
-
-/// Whether a device should be taken over exclusively.
+/// What, if anything, a device should be taken over exclusively for.
 ///
-/// Only devices that can produce a bound key are claimed. Motion devices never
-/// are: re-injecting REL_X/REL_Y loses the DPI properties libinput accelerates
-/// with, which changes how the mouse feels.
-fn should_grab_device(path: &Path, wanted: &HashSet<evdev::KeyCode>) -> bool {
-    let Ok(device) = Device::open(path) else {
-        return false;
-    };
-
-    if device.name() == Some(VIRTUAL_KEYBOARD_NAME) {
-        return false;
+/// A wheel device is claimed only when a binding actually diverts scrolling.
+/// The claim covers the whole device, so its motion is mirrored back out; that
+/// is why the mirror copies the identity libinput accelerates from.
+fn should_grab_device(
+    path: &Path,
+    wanted: &HashSet<evdev::KeyCode>,
+    want_scroll: bool,
+    mirrors: &HashSet<PathBuf>,
+) -> Option<DeviceRole> {
+    // A mirror carries its source's name, so it is only told apart by node.
+    if mirrors.contains(path) {
+        return None;
     }
 
-    let has_motion = device
-        .supported_relative_axes()
-        .map(|axes| axes.contains(RelativeAxisCode::REL_X))
-        .unwrap_or(false);
+    let device = Device::open(path).ok()?;
 
-    if has_motion {
-        return false;
+    if device.name().unwrap_or_default() == VIRTUAL_KEYBOARD_NAME {
+        return None;
     }
 
-    device
+    // Injectors like ydotoold carry a wheel but report no physical path.
+    // Claiming one would swallow the events another tool is synthesizing.
+    let is_physical = device.physical_path().is_some_and(|phys| !phys.is_empty());
+
+    let axes = device.supported_relative_axes();
+    let has_wheel = axes.is_some_and(|axes| axes.contains(RelativeAxisCode::REL_WHEEL));
+    if want_scroll && has_wheel && is_physical {
+        return Some(DeviceRole::Pointer);
+    }
+
+    // Without a wheel to intercept, re-injecting REL_X/REL_Y would only cost
+    // the pointer feel, so motion devices are left alone.
+    if axes.is_some_and(|axes| axes.contains(RelativeAxisCode::REL_X)) {
+        return None;
+    }
+
+    let produces_bound_key = device
         .supported_keys()
-        .map(|keys| wanted.iter().any(|key| keys.contains(*key)))
-        .unwrap_or(false)
+        .is_some_and(|keys| wanted.iter().any(|key| keys.contains(*key)));
+
+    produces_bound_key.then_some(DeviceRole::Keyboard)
 }
 
-/// Find every device that can produce a bound key
-fn find_bindable_devices(wanted: &HashSet<evdev::KeyCode>) -> Result<Vec<PathBuf>> {
+/// Find every device worth claiming, with the role to claim it for.
+fn find_bindable_devices(
+    wanted: &HashSet<evdev::KeyCode>,
+    want_scroll: bool,
+    mirrors: &HashSet<PathBuf>,
+) -> Result<Vec<(PathBuf, DeviceRole)>> {
     let mut devices = Vec::new();
 
     for entry in std::fs::read_dir("/dev/input").context("failed to read /dev/input directory")? {
@@ -925,18 +798,63 @@ fn find_bindable_devices(wanted: &HashSet<evdev::KeyCode>) -> Result<Vec<PathBuf
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.starts_with("event"));
 
-        if is_event_node && should_grab_device(&path, wanted) {
-            devices.push(path);
+        if !is_event_node {
+            continue;
+        }
+
+        if let Some(role) = should_grab_device(&path, wanted, want_scroll, mirrors) {
+            devices.push((path, role));
         }
     }
 
     Ok(devices)
 }
 
+/// Build a uinput device that mirrors `source`, and the nodes it appears at.
+///
+/// The name, ids and phys are copied verbatim because udev's hwdb keys the
+/// mouse DPI off them. A mirror named anything else misses the match, and
+/// libinput then accelerates the pointer against a default DPI instead of the
+/// real one. Since that makes the mirror indistinguishable by name, its device
+/// nodes are returned so we can avoid claiming our own output.
+fn create_device_mirror(source: &Device) -> Result<(VirtualDevice, Vec<PathBuf>)> {
+    // The hwdb key is built from the bus, ids and name, so those are what the
+    // DPI lookup needs. Phys is left unset: UI_SET_PHYS rejects it here.
+    let mut builder = VirtualDevice::builder()?
+        .name(source.name().unwrap_or("rebinded-mirror"))
+        .input_id(source.input_id())
+        .with_properties(source.properties())?;
+
+    if let Some(keys) = source.supported_keys() {
+        builder = builder.with_keys(keys)?;
+    }
+    if let Some(axes) = source.supported_relative_axes() {
+        builder = builder.with_relative_axes(axes)?;
+    }
+    if let Some(misc) = source.misc_properties() {
+        builder = builder.with_msc(misc)?;
+    }
+
+    let mut device = builder.build().context("failed to create mirror")?;
+    let nodes = device
+        .enumerate_dev_nodes_blocking()
+        .context("failed to resolve mirror nodes")?
+        .filter_map(Result::ok)
+        .collect();
+
+    Ok((device, nodes))
+}
+
 /// Grab a device and spawn its reader task, recording it as held on success.
+///
+/// A pointer claim also builds the mirror its events are replayed through; if
+/// that fails the claim is dropped, since holding it would silence the device.
 fn grab_and_spawn(
     path: &Path,
-    held: &mut HashSet<PathBuf>,
+    role: DeviceRole,
+    held: &mut HashMap<PathBuf, DeviceRole>,
+    mirrors: &mut HashMap<PathBuf, VirtualDevice>,
+    mirror_nodes: &mut HashSet<PathBuf>,
     event_tx: &mpsc::UnboundedSender<DeviceMessage>,
 ) {
     let mut device = match Device::open(path) {
@@ -949,6 +867,21 @@ fn grab_and_spawn(
 
     let name = device.name().unwrap_or("unknown").to_string();
 
+    let mirror = if role == DeviceRole::Pointer {
+        match create_device_mirror(&device) {
+            Ok((mirror, nodes)) => {
+                mirror_nodes.extend(nodes);
+                Some(mirror)
+            }
+            Err(e) => {
+                warn!("no mirror for {}, leaving it alone: {:#}", name, e);
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
     if let Err(e) = device.grab() {
         // Contention is normal and often transient (another remapper, or a
         // node that is not settled yet), so the periodic re-scan retries.
@@ -956,8 +889,16 @@ fn grab_and_spawn(
         return;
     }
 
-    info!("grabbed device: {} ({})", name, path.display());
-    held.insert(path.to_path_buf());
+    info!(
+        "grabbed device: {} ({}) as {:?}",
+        name,
+        path.display(),
+        role
+    );
+    held.insert(path.to_path_buf(), role);
+    if let Some(mirror) = mirror {
+        mirrors.insert(path.to_path_buf(), mirror);
+    }
 
     let path = path.to_path_buf();
     let tx = event_tx.clone();
@@ -1079,11 +1020,30 @@ fn convert_event(ev: &evdev::InputEvent) -> Option<InputEvent> {
     }
 }
 
+/// Whether an event carries vertical wheel movement.
+///
+/// The high resolution axis is included so a blocked tick does not leak through
+/// as smooth scrolling, which is the axis modern toolkits actually read.
+fn is_vertical_wheel(ev: &evdev::InputEvent) -> bool {
+    ev.event_type() == EventType::RELATIVE
+        && (ev.code() == RelativeAxisCode::REL_WHEEL.0
+            || ev.code() == RelativeAxisCode::REL_WHEEL_HI_RES.0)
+}
+
+/// The direction of a wheel detent, if this event is one.
+fn detent_direction(ev: &evdev::InputEvent) -> Option<bool> {
+    let is_detent = ev.event_type() == EventType::RELATIVE
+        && ev.code() == RelativeAxisCode::REL_WHEEL.0
+        && ev.value() != 0;
+
+    is_detent.then(|| ev.value() > 0)
+}
+
 /// Create a virtual keyboard for re-injecting events
 ///
 /// Keys only: relative axes make udev tag the device a mouse, which splits it
-/// into a pointer plus keyboard subdevice under libinput. Scroll passthrough
-/// replays the X11 grab rather than re-injecting.
+/// into a pointer plus keyboard subdevice under libinput. A claimed pointer is
+/// replayed through its own mirror instead.
 fn create_virtual_keyboard() -> Result<VirtualDevice> {
     use evdev::AttributeSet;
 
@@ -1650,4 +1610,52 @@ fn ungrab_all_devices() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use assert2::check;
+
+    fn rel(code: RelativeAxisCode, value: i32) -> evdev::InputEvent {
+        evdev::InputEvent::new(EventType::RELATIVE.0, code.0, value)
+    }
+
+    #[test]
+    fn detent_reports_its_direction() {
+        check!(detent_direction(&rel(RelativeAxisCode::REL_WHEEL, 1)) == Some(true));
+        check!(detent_direction(&rel(RelativeAxisCode::REL_WHEEL, -1)) == Some(false));
+    }
+
+    #[test]
+    fn only_a_detent_decides_a_tick() {
+        // Micro-steps trail a detent; treating each as its own tick would run
+        // the divert action several times for one notch of the wheel.
+        check!(detent_direction(&rel(RelativeAxisCode::REL_WHEEL_HI_RES, 120)).is_none());
+        check!(detent_direction(&rel(RelativeAxisCode::REL_WHEEL, 0)).is_none());
+        check!(detent_direction(&rel(RelativeAxisCode::REL_X, 5)).is_none());
+    }
+
+    #[test]
+    fn both_vertical_wheel_axes_are_suppressed_together() {
+        // Passing the high resolution axis through would let a blocked tick
+        // still scroll, since that is the axis toolkits read.
+        check!(is_vertical_wheel(&rel(RelativeAxisCode::REL_WHEEL, 1)));
+        check!(is_vertical_wheel(&rel(
+            RelativeAxisCode::REL_WHEEL_HI_RES,
+            120
+        )));
+    }
+
+    #[test]
+    fn motion_and_horizontal_scroll_are_left_alone() {
+        check!(!is_vertical_wheel(&rel(RelativeAxisCode::REL_X, 5)));
+        check!(!is_vertical_wheel(&rel(RelativeAxisCode::REL_Y, -3)));
+        check!(!is_vertical_wheel(&rel(RelativeAxisCode::REL_HWHEEL, 1)));
+        check!(!is_vertical_wheel(&evdev::InputEvent::new(
+            EventType::KEY.0,
+            evdev::KeyCode::BTN_LEFT.0,
+            1
+        )));
+    }
 }

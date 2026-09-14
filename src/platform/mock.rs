@@ -87,6 +87,7 @@ impl PlatformInterface for MockPlatform {
     async fn run<F, Fut>(
         &mut self,
         _bound_keys: &std::collections::HashSet<crate::key::KeyCode>,
+        _intercept_scroll: bool,
         _handler: F,
     ) -> Result<()>
     where

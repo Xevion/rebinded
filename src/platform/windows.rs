@@ -192,6 +192,7 @@ impl PlatformInterface for Platform {
     async fn run<F, Fut>(
         &mut self,
         _bound_keys: &std::collections::HashSet<crate::key::KeyCode>,
+        _intercept_scroll: bool,
         mut handler: F,
     ) -> Result<()>
     where

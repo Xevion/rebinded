@@ -50,6 +50,19 @@ export default defineConfig({
         "systemctl --user daemon-reload",
         "systemctl --user enable rebinded.service",
         "echo '✓ Installed! Start with: systemctl --user start rebinded'",
+        "echo '  Scroll bindings also need: tempo install-udev-rule'",
+      ].join(" && "),
+    }),
+
+    // Root-owned, so it is kept out of `install` rather than making the whole
+    // install prompt for a password when most of it does not need one.
+    task({
+      name: "rebinded:install-udev-rule",
+      body: [
+        "sudo install -Dm644 99-rebinded.rules /etc/udev/rules.d/99-rebinded.rules",
+        "sudo udevadm control --reload-rules",
+        "sudo udevadm trigger --subsystem-match=input --action=change",
+        "echo '✓ Pointer DPI rule installed'",
       ].join(" && "),
     }),
     task({
@@ -70,6 +83,7 @@ export default defineConfig({
         "rm -f ~/.local/bin/rebinded",
         "systemctl --user daemon-reload",
         "echo '✓ Uninstalled'",
+        "echo '  The udev rule, if installed, is at /etc/udev/rules.d/99-rebinded.rules'",
       ].join(" && "),
     }),
   ],
@@ -88,6 +102,10 @@ export default defineConfig({
     install: {
       description: "Build and install the rebinded systemd service",
       tasks: ["rebinded:install"],
+    },
+    "install-udev-rule": {
+      description: "Install the udev rule scroll bindings need (asks for sudo)",
+      tasks: ["rebinded:install-udev-rule"],
     },
     update: {
       description: "Rebuild and restart the installed service",

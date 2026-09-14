@@ -72,10 +72,15 @@ async fn main() -> ExitCode {
     // Create platform and run event loop
     let mut platform = Platform::new();
     let bound_keys = runtime_config.bindings.keys().copied().collect();
+    let intercept_scroll = runtime_config
+        .subscriptions
+        .keys()
+        .any(|id| matches!(id, crate::key::InputEventId::Scroll { .. }));
 
     if let Err(err) = platform
         .run(
             &bound_keys,
+            intercept_scroll,
             |event: InputEvent, platform_handle: PlatformHandle| {
                 handle_event(event, platform_handle, &runtime_config)
             },

@@ -63,9 +63,14 @@ pub trait PlatformInterface {
     ///
     /// `bound_keys` is every key the config can act on; platforms that take
     /// devices exclusively claim only those that can produce one.
+    ///
+    /// `intercept_scroll` reports whether any binding acts on the wheel. It is
+    /// separate from `bound_keys` because claiming a wheel means claiming the
+    /// pointer it belongs to, which is only worth doing when something uses it.
     async fn run<F, Fut>(
         &mut self,
         bound_keys: &std::collections::HashSet<crate::key::KeyCode>,
+        intercept_scroll: bool,
         handler: F,
     ) -> anyhow::Result<()>
     where

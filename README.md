@@ -16,6 +16,20 @@ tempo start
 tempo start -- --release
 ```
 
+## Installation
+
+```bash
+tempo install            # binary + user systemd unit
+tempo install-udev-rule  # only needed for scroll bindings; asks for sudo
+```
+
+Scroll bindings claim the pointer the wheel belongs to and replay it through a
+uinput mirror. udev derives a mouse's DPI from its USB parent, which a mirror
+does not have, so without the rule libinput accelerates the pointer against a
+default DPI and the mouse feels wrong. The rule reruns that lookup for the
+mirror. Bindings that do not act on the wheel never claim a pointer and do not
+need it.
+
 ## Configuration
 
 Place your config at `~/.config/rebinded/config.toml` (or specify with `--config`).
