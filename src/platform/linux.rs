@@ -516,7 +516,15 @@ fn x11_session(
                 let Some(grab) = scroll.as_ref() else {
                     continue;
                 };
+                // Root selection reports each press twice, for the slave and
+                // for the master. Only the master's copy activated the grab.
+                if ev.deviceid != grab.pointer {
+                    continue;
+                }
+
                 let Some(up) = grab.classify(&ev) else {
+                    // A source we ignore still froze the device.
+                    grab.allow(&conn, true);
                     continue;
                 };
 
