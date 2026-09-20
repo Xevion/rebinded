@@ -19,7 +19,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.92"
+          toolchain: "1.98"
           components: rustfmt, clippy
 
       - name: Cache dependencies
@@ -73,7 +73,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.92"
+          toolchain: "1.98"
           targets: ${{ matrix.target }}
 
       - name: Cache dependencies
@@ -112,7 +112,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.92"
+          toolchain: "1.98"
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
