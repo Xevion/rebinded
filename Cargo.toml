@@ -36,7 +36,7 @@ windows = { version = "0.61", features = [
 [target.'cfg(unix)'.dependencies]
 evdev = { version = "0.13", features = ["tokio"] }
 nix = { version = "0.31.3", default-features = false, features = ["inotify"] }
-x11rb = { version = "0.13", features = ["allow-unsafe-code", "xinput"] }
+x11rb = { version = "0.14", features = ["allow-unsafe-code", "xinput"] }
 zbus = "5"
 
 [dev-dependencies]
